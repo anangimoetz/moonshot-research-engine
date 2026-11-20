@@ -4,12 +4,13 @@ services:
   - type: web
     name: moonshot-research-engine
     runtime: python
+    rootDir: Moonshot_Research_Engine
     plan: starter
     region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: python -m moonshot_scanner.supervise
     healthCheckPath: /healthz
-    autoDeploy: false
+    autoDeployTrigger: 'off'
     disk:
       name: research-state
       mountPath: /var/data/moonshot
