@@ -1,0 +1,16 @@
+const {test}=require('node:test');const a=require('node:assert/strict');
+const f=require('../static/live-chart.js');
+const now=180000,c={exchange:'bitget',symbol:'BTCUSDT',product:'SPOT',interval:'1m'};
+const message={arg:{symbol:'BTCUSDT',instType:'spot',topic:'kline',interval:'1m'},ts:now,data:[{start:'120000',open:'10',high:'12',low:'9',close:'11'}]};
+test('bitget official v3 envelope decodes',()=>{a.equal(f.decode(message,c,now).length,1);a.equal(f.decode(message,c,now)[0].close,11)});
+test('wrong asset/product/timeframe are ignored',()=>{for(const field of ['symbol','instType','interval'])a.equal(f.decode({...message,arg:{...message.arg,[field]:'wrong'}},c,now).length,0)});
+test('heartbeat never becomes market tick',()=>a.deepEqual(f.decode({op:'pong',ts:now},c,now),[]));
+test('null/boolean/broken OHLC rejected',()=>{a.deepEqual(f.decode({...message,data:[null]},c,now),[]);a.equal(f.bar({open_time:120000,open:true,high:12,low:9,close:11},c,now),null);a.equal(f.bar({open_time:120000,open:10,high:9,low:8,close:11},c,now),null)});
+test('future event rejected',()=>a.deepEqual(f.decode({...message,ts:now+10000},c,now),[]));
+test('open candle remains developing',()=>a.equal(f.decode(message,c,now-1000)[0].is_closed,false));
+test('gap requires history recovery',()=>a.equal(f.merge([{time:60}],{time:180},'1m').status,'GAP'));
+test('out of order cannot overwrite latest',()=>a.equal(f.merge([{time:120}],{time:60},'1m').status,'OUT_OF_ORDER'));
+test('current candle updates rather than appends',()=>a.equal(f.merge([{time:120,close:10}],{time:120,close:11},'1m').bars.length,1));
+test('Bitget daily never mixes UTC+8 stream with UTC history',()=>a.equal(f.protocol({...c,interval:'1d'}).restOnly,true));
+test('perpetual uses distinct exchange stream',()=>{a.match(f.protocol({...c,exchange:'bybit',product:'USDT-FUTURES'}).url,/linear$/);a.match(f.protocol({...c,exchange:'binance',product:'USDT-FUTURES'}).url,/fstream/)});
+test('EMA excludes developing candle',()=>{const bars=Array.from({length:14},(_,i)=>({time:i,close:10,is_closed:i<13}));bars[13].close=10000;a.ok(Math.abs(f.ema(bars,13).at(-1).value-10)<1e-12)});

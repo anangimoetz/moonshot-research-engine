@@ -1,0 +1,39 @@
+{
+  "prepared_at_utc": "2026-11-20T08:10:13.134848+00:00",
+  "scanner_regression_tests": 192,
+  "monitor_push_tests": 16,
+  "legacy_engine_checks": 13,
+  "total_offline_tests": 233,
+  "all_passed": true,
+  "python": "3.11",
+  "dependencies": {
+    "Flask": "3.1.3",
+    "requests": "2.34.2",
+    "Telethon": "1.46.0",
+    "tzdata": "2026.6"
+  },
+  "pip_check": "PASS",
+  "javascript_syntax": "PASS",
+  "live_standalone_scan": {
+    "attempted": 2,
+    "returned": 2,
+    "errors": 0,
+    "source_errors": 0,
+    "ready": 0,
+    "early": 0,
+    "status": "COMPLETE",
+    "no_call_is_valid": true,
+    "probability": null
+  },
+  "deployment": "NOT_DEPLOYED",
+  "linux_gunicorn_runtime": "NOT_RUN_ON_WINDOWS",
+  "telegram_end_to_end": "NOT_TESTED; configure rotated token privately in Render",
+  "mira_account_connection": "NOT_CONNECTED",
+  "browser_visual_QA": "PASS: EVAA Bitget SPOT live 4h and1m, stale analysis remains WAIT",
+  "source_zip_sha256": "16434d73769f91035cfce9d2c326f6ec4ddd828e5d5008652d47f649603a0ec0",
+  "version": "3.1.0",
+  "javascript_chart_tests": 12,
+  "public_websocket_live": "PASS: Bitget Binance Bybit",
+  "telegram_recipient_configured": true,
+  "secret_not_embedded": true
+}

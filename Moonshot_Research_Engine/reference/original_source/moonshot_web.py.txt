@@ -1,0 +1,1664 @@
+#!/usr/bin/env python3
+"""
+BITGET MOONSHOT SCANNER — WEB DASHBOARD
+=======================================
+
+A web UI on top of bitget_moonshot_scanner_v2.py.
+
+Run it, open the printed URL in your browser, then:
+  - set your account size and risk %,
+  - scan specific coins or auto-discover small/early candidates,
+  - watch results stream into a sortable table with score bars + tier badges,
+  - click any coin to see a candlestick chart with the entry / stop / TP
+    levels drawn on it, plus the full mechanical trade plan.
+
+No API key required (same public Bitget + CoinGecko data the scanner uses).
+
+Start (local only):
+    pip install -r requirements_moonshot.txt
+    python moonshot_web.py
+Then open:  http://127.0.0.1:5000
+
+
+ACCESS FROM ANOTHER DEVICE
+--------------------------
+1) Same Wi-Fi / LAN (easiest):
+       set MOONSHOT_HOST=0.0.0.0
+       python moonshot_web.py
+   Then on the other device open:  http://<this-PC-LAN-IP>:5000
+
+2) Public URL from anywhere (no router setup) via a tunnel:
+       set MOONSHOT_HOST=0.0.0.0
+       python moonshot_web.py
+       cloudflared tunnel --url http://localhost:5000   # or ngrok http 5000
+
+3) Protect it once it is reachable by others:
+       set MOONSHOT_TOKEN=some-long-secret
+   Then browse to:  http://<host>:5000/?token=some-long-secret
+
+4) Production server (recommended when exposed): install waitress and it is
+   used automatically. Force the dev server with MOONSHOT_DEV=1.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import secrets
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+import requests
+from flask import Flask, Response, jsonify, request, stream_with_context
+
+# Reuse ALL the existing scanner logic. Importing is safe because the module
+# guards its CLI behind `if __name__ == "__main__"`.
+import bitget_moonshot_scanner_v2 as scanner
+
+app = Flask(__name__)
+
+STATE_PATH = Path(scanner.DEFAULT_STATE_FILE)
+CG_CACHE = Path(scanner.COINGECKO_LIST_CACHE)
+WATCH_PATH = Path(".moonshot_watchlist.json")
+ALERTS_PATH = Path(".moonshot_alerts.json")
+
+# Optional shared access token. If set (via env or --token), every request must
+# carry it as ?token=... , an X-Token header, or a Bearer Authorization header.
+ACCESS_TOKEN = os.environ.get("MOONSHOT_TOKEN", "").strip()
+
+# Alert channels (all optional; no-op if unset).
+TELEGRAM_TOKEN = os.environ.get("MOONSHOT_TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT = os.environ.get("MOONSHOT_TELEGRAM_CHAT", "").strip()
+WEBHOOK_URL = os.environ.get("MOONSHOT_WEBHOOK", "").strip()
+
+# Background auto-scan scheduler (optional). Enable by setting the interval > 0.
+AUTOSCAN_INTERVAL_MIN = float(os.environ.get("MOONSHOT_AUTOSCAN_MIN", "0") or 0)
+AUTOSCAN_UNIVERSE = int(os.environ.get("MOONSHOT_AUTOSCAN_N", "25") or 25)
+AUTOSCAN_MIN_ASYM = int(os.environ.get("MOONSHOT_AUTOSCAN_MIN_ASYM", "60") or 60)
+
+
+def _token_ok() -> bool:
+    if not ACCESS_TOKEN:
+        return True  # no token configured => open (fine for localhost/LAN)
+    supplied = (
+        request.args.get("token", "")
+        or request.headers.get("X-Token", "")
+        or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    )
+    return bool(supplied) and secrets.compare_digest(supplied, ACCESS_TOKEN)
+
+
+@app.before_request
+def _gate():
+    if request.path == "/" or request.path.startswith("/static"):
+        return None
+    if not _token_ok():
+        return jsonify({"error": "unauthorized: missing or wrong token"}), 401
+
+
+def _clean(obj: Any) -> Any:
+    """Make results JSON-safe (NaN/inf -> None)."""
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (np.floating,)):
+        f = float(obj)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Alerts: Telegram + generic webhook, plus a persistent server-side event log
+# ---------------------------------------------------------------------------
+
+_alerts_lock = threading.Lock()
+
+
+def _load_alerts() -> Dict[str, Any]:
+    if not ALERTS_PATH.exists():
+        return {"events": [], "seen": {}}
+    try:
+        d = json.loads(ALERTS_PATH.read_text(encoding="utf-8"))
+        d.setdefault("events", [])
+        d.setdefault("seen", {})
+        return d
+    except Exception:
+        return {"events": [], "seen": {}}
+
+
+def _save_alerts(d: Dict[str, Any]) -> None:
+    try:
+        d["events"] = d.get("events", [])[-200:]  # keep last 200 events
+        ALERTS_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def send_telegram(text: str) -> bool:
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
+        return False
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=10,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def send_webhook(payload: Dict[str, Any]) -> bool:
+    if not WEBHOOK_URL:
+        return False
+    try:
+        requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        return True
+    except Exception:
+        return False
+
+
+def record_alert(kind: str, symbol: str, detail: Dict[str, Any]) -> None:
+    """
+    Record a de-duplicated alert event and fan it out to configured channels.
+    De-dup key = kind+symbol; the same breakout won't spam every check.
+    """
+    with _alerts_lock:
+        d = _load_alerts()
+        dedup_key = f"{kind}:{symbol}"
+        last = d["seen"].get(dedup_key, 0)
+        now = time.time()
+        # Suppress repeats within 6 hours.
+        if now - last < 6 * 3600:
+            return
+        d["seen"][dedup_key] = now
+        ev = {
+            "ts": scanner.utc_now_iso(),
+            "kind": kind,
+            "symbol": symbol,
+            **detail,
+        }
+        d["events"].append(ev)
+        _save_alerts(d)
+
+    price = detail.get("price")
+    trig = detail.get("trigger")
+    if kind == "BREAKOUT":
+        msg = (f"🚀 <b>BREAKOUT</b> {symbol}\nprice {price} broke trigger {trig}\n"
+               f"tier {detail.get('tier','-')} · verdict {detail.get('verdict','-')}")
+    elif kind == "INVALIDATED":
+        msg = f"🛑 <b>INVALIDATED</b> {symbol}\nprice {price} broke stop {detail.get('stop')}"
+    else:
+        msg = f"{kind} {symbol}"
+    send_telegram(msg)
+    send_webhook({"kind": kind, "symbol": symbol, **detail})
+
+
+def check_watch_and_alert() -> List[Dict[str, Any]]:
+    """
+    Re-price every watched coin, update status, and fire alerts on new
+    BREAKOUT / INVALIDATED transitions. Returns the current status rows.
+    """
+    d = _load_watch()
+    out = []
+    for sym, it in d.get("items", {}).items():
+        row = {"symbol": sym, "trigger": it.get("trigger"), "stop": it.get("stop"),
+               "tier": it.get("tier"), "phase": it.get("phase"), "verdict": it.get("verdict"),
+               "price": None, "status": "unknown"}
+        try:
+            t = scanner.fetch_ticker(sym, "SPOT")
+            price = scanner.sf(t.get("lastPrice"), scanner.sf(t.get("close")))
+            if price == price:  # not NaN
+                row["price"] = float(price)
+                trig = scanner.sf(it.get("trigger"))
+                stop = scanner.sf(it.get("stop"))
+                if stop and price <= stop:
+                    row["status"] = "INVALIDATED"
+                    record_alert("INVALIDATED", sym, {"price": row["price"], "stop": float(stop)})
+                elif trig and price >= trig:
+                    row["status"] = "BREAKOUT"
+                    record_alert("BREAKOUT", sym, {"price": row["price"], "trigger": float(trig),
+                                                   "tier": it.get("tier"), "verdict": it.get("verdict")})
+                elif trig:
+                    row["status"] = "WAITING"
+                    row["to_trigger_pct"] = (trig / price - 1.0) * 100.0 if price > 0 else None
+        except Exception as e:
+            row["status"] = "error"
+            row["error"] = str(e)
+        out.append(_clean(row))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Background auto-scan scheduler (optional)
+# ---------------------------------------------------------------------------
+_scheduler_started = False
+
+
+def _autoscan_loop():
+    """
+    Periodically re-check the watchlist (so breakouts alert even with no browser
+    open) and, if a universe size is set, refresh a moonshot scan whose top
+    picks get auto-added to the watchlist. Runs in a daemon thread.
+    """
+    # Small initial delay so the web server binds first.
+    time.sleep(20)
+    while True:
+        try:
+            check_watch_and_alert()
+        except Exception:
+            pass
+
+        # Self-improvement: grade matured predictions and re-tune weights.
+        try:
+            run_learning_cycle()
+        except Exception:
+            pass
+
+        if AUTOSCAN_UNIVERSE > 0:
+            try:
+                state = scanner.load_state(STATE_PATH)
+                btc = scanner.btc_regime()
+                syms = scanner.discover_candidates(
+                    AUTOSCAN_UNIVERSE, 500_000, max_turnover_usdt=50_000_000, moonshot_mode=True
+                )
+                w = _load_watch()
+                for sym in syms:
+                    try:
+                        r = scanner.analyze_symbol(sym, state, btc, CG_CACHE, journal=True)
+                        if (r.get("asymmetry_score") or 0) >= AUTOSCAN_MIN_ASYM and \
+                           r.get("phase") in ("COILED_EARLY", "EARLY_BREAKOUT", "BASING"):
+                            w.setdefault("items", {})[sym] = {
+                                "symbol": sym, "trigger": r.get("trigger_level"),
+                                "entry_low": r.get("entry_low"), "entry_high": r.get("entry_high"),
+                                "stop": r.get("stop"), "tp1": r.get("tp1"),
+                                "phase": r.get("phase"), "tier": r.get("moonshot_tier"),
+                                "verdict": r.get("verdict"), "added_utc": scanner.utc_now_iso(),
+                                "auto": True,
+                            }
+                    except Exception:
+                        pass
+                    time.sleep(scanner.REQUEST_SLEEP)
+                _save_watch(w)
+                scanner.save_state(STATE_PATH, state)
+            except Exception:
+                pass
+
+        time.sleep(max(60.0, AUTOSCAN_INTERVAL_MIN * 60.0))
+
+
+def _start_scheduler_once():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    if AUTOSCAN_INTERVAL_MIN <= 0:
+        return
+    _scheduler_started = True
+    threading.Thread(target=_autoscan_loop, daemon=True).start()
+
+
+@app.route("/")
+def index() -> Response:
+    resp = Response(INDEX_HTML, mimetype="text/html")
+    # Always serve the freshest UI so redeploys show up without a hard refresh.
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
+@app.route("/api/candles")
+def api_candles() -> Response:
+    """OHLC candles for the chart. e.g. /api/candles?symbol=SUIUSDT&interval=4H"""
+    symbol = request.args.get("symbol", "BTCUSDT")
+    interval = request.args.get("interval", "4H")
+    try:
+        limit = int(request.args.get("limit", "200"))
+    except ValueError:
+        limit = 200
+
+    try:
+        df = scanner.fetch_candles(symbol, interval, min(limit, 1000), "SPOT")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    candles = [
+        {
+            "time": int(row.timestamp // 1000),
+            "open": float(row.open),
+            "high": float(row.high),
+            "low": float(row.low),
+            "close": float(row.close),
+            "volume": float(row.volume),
+        }
+        for row in df.itertuples(index=False)
+    ]
+    return jsonify({"symbol": symbol, "interval": interval, "candles": candles})
+
+
+@app.route("/api/scan")
+def api_scan() -> Response:
+    """Stream scan results as newline-delimited JSON (one object per line)."""
+    symbols_param = request.args.get("symbols", "").strip()
+    auto = int(request.args.get("auto", "0") or 0)
+    min_turnover = float(request.args.get("min_turnover", "1000000") or 1000000)
+    max_turnover = float(request.args.get("max_turnover", "0") or 0)
+    account = float(request.args.get("account", "1000") or 1000)
+    risk = float(request.args.get("risk", "1.0") or 1.0)
+    min_asym = int(request.args.get("min_asymmetry", "0") or 0)
+    with_fund = request.args.get("fundamentals", "1") != "0"
+    with_oc = request.args.get("onchain", "1") != "0"
+
+    @stream_with_context
+    def generate():
+        state = scanner.load_state(STATE_PATH)
+
+        btc = scanner.btc_regime()
+        yield json.dumps({"type": "regime", "regime": _clean(btc)}) + "\n"
+
+        if symbols_param:
+            symbols = [scanner.symbol_clean(s) for s in symbols_param.split(",") if s.strip()]
+        elif auto > 0:
+            symbols = scanner.discover_candidates(
+                auto, min_turnover,
+                max_turnover_usdt=max_turnover,
+                moonshot_mode=True,
+            )
+        else:
+            symbols = scanner.DEFAULT_SYMBOLS
+
+        yield json.dumps({"type": "start", "symbols": symbols, "count": len(symbols)}) + "\n"
+
+        for idx, sym in enumerate(symbols, start=1):
+            try:
+                r = scanner.analyze_symbol(
+                    sym, state, btc, CG_CACHE,
+                    account_usd=account,
+                    risk_pct=risk,
+                    with_fundamentals=with_fund,
+                    with_onchain=with_oc,
+                    journal=True,
+                )
+                asym = r.get("asymmetry_score") or 0
+                if min_asym and asym < min_asym:
+                    yield json.dumps({"type": "skip", "symbol": sym, "index": idx}) + "\n"
+                    continue
+                yield json.dumps({"type": "result", "index": idx, "data": _clean(r)}) + "\n"
+            except Exception as e:
+                yield json.dumps({"type": "error", "symbol": sym, "index": idx, "message": str(e)}) + "\n"
+
+        try:
+            scanner.save_state(STATE_PATH, state)
+        except Exception:
+            pass
+
+        yield json.dumps({"type": "done"}) + "\n"
+
+    return Response(generate(), mimetype="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# Watchlist + breakout alerts
+# ---------------------------------------------------------------------------
+# The whole point of catching a COILED_EARLY / BASING coin is to act WHEN it
+# actually breaks out. This layer lets you save a coin with its breakout
+# trigger level, then re-check live prices and flag any that have crossed it.
+# Storage is a small JSON file. On Render's ephemeral disk it resets on
+# redeploy/sleep, which is fine for a personal watchlist; the front-end also
+# keeps a copy in localStorage as a backup.
+
+
+def _load_watch() -> Dict[str, Any]:
+    if not WATCH_PATH.exists():
+        return {"items": {}}
+    try:
+        d = json.loads(WATCH_PATH.read_text(encoding="utf-8"))
+        d.setdefault("items", {})
+        return d
+    except Exception:
+        return {"items": {}}
+
+
+def _save_watch(d: Dict[str, Any]) -> None:
+    try:
+        WATCH_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+@app.route("/api/watch", methods=["GET", "POST", "DELETE"])
+def api_watch() -> Response:
+    d = _load_watch()
+
+    if request.method == "GET":
+        return jsonify({"items": list(d["items"].values())})
+
+    body = request.get_json(silent=True) or {}
+    sym = scanner.symbol_clean(str(body.get("symbol", "")))
+    if not sym:
+        return jsonify({"error": "symbol required"}), 400
+
+    if request.method == "DELETE":
+        d["items"].pop(sym, None)
+        _save_watch(d)
+        return jsonify({"ok": True, "items": list(d["items"].values())})
+
+    # POST: add / update a watch entry with its breakout trigger.
+    d["items"][sym] = {
+        "symbol": sym,
+        "trigger": float(body.get("trigger", 0) or 0),
+        "entry_low": float(body.get("entry_low", 0) or 0),
+        "entry_high": float(body.get("entry_high", 0) or 0),
+        "stop": float(body.get("stop", 0) or 0),
+        "tp1": float(body.get("tp1", 0) or 0),
+        "phase": body.get("phase"),
+        "tier": body.get("moonshot_tier"),
+        "verdict": body.get("verdict"),
+        "added_utc": scanner.utc_now_iso(),
+    }
+    _save_watch(d)
+    return jsonify({"ok": True, "items": list(d["items"].values())})
+
+
+@app.route("/api/watch/check")
+def api_watch_check() -> Response:
+    """
+    Re-price every watched coin, update status, and fire alerts on NEW
+    breakout / invalidation transitions (Telegram + webhook if configured).
+    This is what turns 'pre-move' picks into actionable alerts.
+    """
+    return jsonify({"items": check_watch_and_alert()})
+
+
+@app.route("/api/alerts")
+def api_alerts() -> Response:
+    """Return the recent server-side alert event feed (newest first)."""
+    d = _load_alerts()
+    return jsonify({
+        "events": list(reversed(d.get("events", [])))[:60],
+        "channels": {
+            "telegram": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT),
+            "webhook": bool(WEBHOOK_URL),
+        },
+        "autoscan_min": AUTOSCAN_INTERVAL_MIN,
+    })
+
+
+@app.route("/api/discover")
+def api_discover() -> Response:
+    """
+    Discovery feeds for finding genuinely early names:
+      kind=new       -> recently listed Bitget spot pairs (fresh listings)
+      kind=trending  -> DexScreener boosted/trending on-chain tokens
+    """
+    kind = request.args.get("kind", "new")
+    try:
+        if kind == "trending":
+            return jsonify({"kind": kind, "items": _clean(scanner.dex_trending_tokens(30))})
+        max_age = float(request.args.get("max_age_days", "30") or 30)
+        return jsonify({"kind": "new", "items": _clean(scanner.new_listing_radar(max_age, 40))})
+    except Exception as e:
+        return jsonify({"error": str(e), "items": []}), 500
+
+
+# ---------------------------------------------------------------------------
+# Learning loop endpoints
+# ---------------------------------------------------------------------------
+
+def _spot_price(sym: str) -> float:
+    t = scanner.fetch_ticker(sym, "SPOT")
+    return scanner.sf(t.get("lastPrice"), scanner.sf(t.get("close")))
+
+
+def run_learning_cycle() -> Dict[str, Any]:
+    """Grade matured predictions against live prices, then re-tune weights."""
+    counts = scanner.evaluate_predictions(_spot_price)
+    stats = scanner.learn_from_outcomes()
+    stats["graded_now"] = counts
+    return stats
+
+
+@app.route("/api/session")
+def api_session() -> Response:
+    """Current Yerevan-time market session + favorability."""
+    return jsonify(_clean(scanner.session_profile()))
+
+
+@app.route("/api/market")
+def api_market() -> Response:
+    """
+    BTC + ETH market context: price, 24h, trend read. Alts largely follow these,
+    so a bearish BTC/ETH is a reason to size down or stay flat on alt longs.
+    """
+    out = {}
+    for sym in ("BTCUSDT", "ETHUSDT"):
+        try:
+            df = scanner.fetch_candles(sym, "4H", 200, "SPOT")
+            snap = scanner.snapshot(df)
+            t = scanner.fetch_ticker(sym, "SPOT")
+            out[sym] = _clean({
+                "price": snap["close"],
+                "change_24h_pct": scanner.sf(t.get("price24hPcnt"), 0.0) * 100,
+                "rsi_4h": snap["rsi"],
+                "trend_4h": snap["trend_score"],
+                "ema20": snap["ema20"], "ema50": snap["ema50"], "ema200": snap["ema200"],
+                "above_ema200": bool(snap["close"] > snap["ema200"]),
+            })
+        except Exception as e:
+            out[sym] = {"error": str(e)}
+    try:
+        out["regime"] = _clean(scanner.btc_regime())
+    except Exception:
+        out["regime"] = {}
+    return jsonify(out)
+
+
+@app.route("/api/learn/stats")
+def api_learn_stats() -> Response:
+    """
+    The scanner's self-improvement report: hit rate, per-factor edge, current
+    learned weights, sample size, and the recent prediction journal.
+    """
+    d = scanner.load_learn()
+    preds = d.get("predictions", [])
+    recent = list(reversed(preds))[:40]
+    return jsonify({
+        "weights": d.get("weights", {}),
+        "stats": d.get("stats", {}),
+        "predictions": _clean(recent),
+        "total_predictions": len(preds),
+        "min_samples": scanner.LEARN_MIN_SAMPLES,
+        "horizon_hours": scanner.LEARN_HORIZON_HOURS,
+        "hit_threshold_pct": scanner.LEARN_HIT_PCT,
+    })
+
+
+@app.route("/api/learn/evaluate", methods=["POST", "GET"])
+def api_learn_evaluate() -> Response:
+    """Manually trigger an evaluation + learning cycle (also runs on schedule)."""
+    try:
+        stats = run_learning_cycle()
+        return jsonify({"ok": True, "stats": _clean(stats)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# The dashboard is a single self-contained HTML page (chart lib from CDN).
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Bitget Moonshot Scanner</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root{
+    --bg:#070a12; --bg2:#0c111c; --panel:#121826; --panel2:#1a2233; --panel3:#222c42;
+    --line:#26314a; --line2:#324063;
+    --text:#eef3fb; --muted:#8a97ad; --dim:#5b6982;
+    --green:#22c55e; --red:#f43f5e; --accent:#5b8cff; --accent2:#8b5cf6;
+    --gold:#f5b301; --cyan:#22d3ee;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{background:radial-gradient(1200px 600px at 20% -10%, #16203a 0%, var(--bg) 55%);
+    color:var(--text); font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  a{color:var(--accent);}
+
+  /* Header */
+  header{position:sticky;top:0;z-index:20;
+    background:linear-gradient(90deg,#101a30 0%,#0c1120 100%);
+    border-bottom:1px solid var(--line); padding:14px 22px;
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap; backdrop-filter:blur(6px);}
+  .brand{display:flex;align-items:center;gap:10px;}
+  .brand .logo{width:34px;height:34px;border-radius:9px;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    display:grid;place-items:center;font-size:18px;box-shadow:0 4px 18px rgba(91,140,255,.4);}
+  .brand h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px;}
+  .brand .sub{font-size:11px;color:var(--muted);margin-top:1px;}
+  .regime{margin-left:auto;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);}
+  .regime .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);box-shadow:0 0 0 3px rgba(255,255,255,.04);}
+  .regime.on .dot{background:var(--green);box-shadow:0 0 10px var(--green);}
+  .regime.off .dot{background:var(--red);box-shadow:0 0 10px var(--red);}
+  .regime.mixed .dot{background:var(--gold);box-shadow:0 0 10px var(--gold);}
+  .session{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;}
+  .session .sfav{font-weight:700;padding:1px 7px;border-radius:20px;font-size:11px;}
+  .session .sfav.hi{background:rgba(34,197,94,.18);color:#7ff0a8;}
+  .session .sfav.mid{background:rgba(245,179,1,.15);color:#ffd873;}
+  .session .sfav.lo{background:rgba(244,63,94,.15);color:#ff9fae;}
+
+  /* Controls */
+  .controls{padding:16px 22px 8px;display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;}
+  .fld{display:flex;flex-direction:column;gap:5px;}
+  .fld label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;font-weight:600;}
+  input,select{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+    border-radius:9px;padding:9px 11px;font-size:13px;outline:none;transition:border .15s,box-shadow .15s;}
+  input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,140,255,.18);}
+  input[type=text]{min-width:190px;}
+  input[type=number]{width:104px;}
+  .scanbtn{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:0;
+    border-radius:10px;padding:11px 26px;font-size:14px;font-weight:700;cursor:pointer;
+    box-shadow:0 6px 20px rgba(91,140,255,.35);transition:transform .08s, box-shadow .15s;}
+  .scanbtn:hover{transform:translateY(-1px);box-shadow:0 8px 26px rgba(91,140,255,.5);}
+  .scanbtn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none;}
+
+  /* Progress */
+  .progwrap{padding:4px 22px 0;}
+  .progbar{height:4px;background:var(--panel2);border-radius:4px;overflow:hidden;display:none;}
+  .progbar.show{display:block;}
+  .progbar i{display:block;height:100%;width:0;border-radius:4px;
+    background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width .3s;}
+  .statusline{padding:6px 22px 0;font-size:12px;color:var(--muted);min-height:18px;}
+
+  /* BTC/ETH market context bar */
+  .marketbar{margin:4px 22px 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+    background:linear-gradient(90deg,rgba(245,179,1,.06),transparent);border:1px solid var(--line);
+    border-radius:12px;padding:10px 14px;}
+  .mkt{display:flex;align-items:center;gap:8px;font-size:13px;padding:4px 10px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);}
+  .mkt .mname{font-weight:800;letter-spacing:.4px;}
+  .mkt.bull{border-color:rgba(34,197,94,.4);} .mkt.bear{border-color:rgba(244,63,94,.4);}
+  .mkt .mval{font-family:"Consolas",monospace;}
+  .mktnote{color:var(--muted);font-size:12px;margin-left:auto;}
+
+  /* Direction badge */
+  .dir{font-size:10px;font-weight:800;padding:2px 8px;border-radius:6px;letter-spacing:.4px;}
+  .dir.LONG{background:rgba(34,197,94,.18);color:#7ff0a8;border:1px solid rgba(34,197,94,.45);}
+  .dir.SHORT{background:rgba(244,63,94,.18);color:#ff9fae;border:1px solid rgba(244,63,94,.45);}
+  .dir.NEUTRAL{background:rgba(138,151,173,.14);color:#c7ced8;}
+
+  /* Discipline banner */
+  .disc{margin:12px 0;padding:12px 14px;border-radius:12px;font-size:13px;}
+  .disc.chase{background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.45);color:#ffc4cc;}
+  .disc.caution{background:rgba(245,179,1,.1);border:1px solid rgba(245,179,1,.4);color:#ffe0a3;}
+  .disc.ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.35);color:#bff0cf;}
+  .disc b{display:block;margin-bottom:4px;font-size:13px;}
+  .disc ul{margin:4px 0 0 16px;padding:0;} .disc li{margin:2px 0;}
+  .patchip{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:3px 9px;font-size:11px;margin:2px;display:inline-block;}
+  .patchip.bull{border-color:rgba(34,197,94,.4);color:#9be9b5;}
+  .patchip.bear{border-color:rgba(244,63,94,.4);color:#ffb3bd;}
+
+  /* Summary cards */
+  .cards{padding:12px 22px;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
+  .card{background:linear-gradient(160deg,var(--panel) 0%,var(--panel2) 100%);
+    border:1px solid var(--line);border-radius:14px;padding:14px 16px;}
+  .card .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;}
+  .card .val{font-size:24px;font-weight:800;margin-top:4px;letter-spacing:.3px;}
+  .card .val.small{font-size:16px;font-weight:700;}
+
+  /* Layout */
+  main{display:grid;grid-template-columns:1fr 560px;gap:16px;padding:6px 22px 24px;align-items:start;}
+  @media (max-width:1200px){main{grid-template-columns:1fr;}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden;}
+  .panel .phead{padding:12px 16px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px;
+    display:flex;align-items:center;justify-content:space-between;color:var(--text);}
+  .phead .hint{font-size:11px;color:var(--dim);font-weight:500;}
+
+  /* Table */
+  .tblwrap{max-height:calc(100vh - 300px);overflow:auto;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{padding:10px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;}
+  th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:700;cursor:pointer;
+    user-select:none;font-size:10px;text-transform:uppercase;letter-spacing:.5px;z-index:2;}
+  th:hover{color:var(--text);}
+  th:first-child,td:first-child{text-align:left;}
+  tbody tr{cursor:pointer;transition:background .1s;}
+  tbody tr:hover{background:var(--panel2);}
+  tbody tr.selected{background:linear-gradient(90deg,rgba(91,140,255,.18),transparent);
+    box-shadow:inset 3px 0 0 var(--accent);}
+  .sym{font-weight:700;}
+  .sym .rank{color:var(--dim);font-weight:600;margin-right:7px;font-size:11px;}
+
+  /* Tier badge */
+  .tier{padding:3px 9px;border-radius:20px;font-size:10px;font-weight:800;letter-spacing:.3px;
+    display:inline-block;border:1px solid transparent;}
+  .tier.prime{background:rgba(34,197,94,.16);color:#7ff0a8;border-color:rgba(34,197,94,.4);}
+  .tier.strong{background:rgba(91,140,255,.16);color:#a9c4ff;border-color:rgba(91,140,255,.4);}
+  .tier.spec{background:rgba(245,179,1,.15);color:#ffd873;border-color:rgba(245,179,1,.35);}
+  .tier.low{background:rgba(138,151,173,.14);color:#b9c3d4;border-color:rgba(138,151,173,.3);}
+  .tier.avoid,.tier.chasing{background:rgba(244,63,94,.15);color:#ff9fae;border-color:rgba(244,63,94,.35);}
+
+  /* Score bar */
+  .score{display:flex;align-items:center;gap:8px;justify-content:flex-end;}
+  .barwrap{width:56px;height:7px;background:var(--panel3);border-radius:5px;overflow:hidden;}
+  .bar{height:100%;border-radius:5px;}
+  .bar.hi{background:linear-gradient(90deg,#22c55e,#a3e635);}
+  .bar.mid{background:linear-gradient(90deg,#5b8cff,#22d3ee);}
+  .bar.lo{background:linear-gradient(90deg,#8a97ad,#5b6982);}
+  .score b{font-variant-numeric:tabular-nums;min-width:22px;text-align:right;}
+
+  .pos{color:var(--green);} .neg{color:var(--red);}
+  .empty{padding:56px 20px;text-align:center;color:var(--muted);}
+  .empty .big{font-size:40px;opacity:.5;margin-bottom:10px;}
+
+  /* Verdict pill */
+  .verdict{font-size:10px;font-weight:800;padding:3px 8px;border-radius:6px;letter-spacing:.3px;display:inline-block;}
+  .verdict.strong{background:rgba(34,197,94,.2);color:#7ff0a8;border:1px solid rgba(34,197,94,.5);}
+  .verdict.buy{background:rgba(91,140,255,.18);color:#a9c4ff;border:1px solid rgba(91,140,255,.45);}
+  .verdict.neutral{background:rgba(138,151,173,.14);color:#c7ced8;}
+  .verdict.avoid{background:rgba(244,63,94,.16);color:#ff9fae;border:1px solid rgba(244,63,94,.4);}
+
+  /* Factor breakdown bars */
+  .factors{margin-top:14px;}
+  .factorrow{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:12px;}
+  .factorrow .fl{width:92px;color:var(--muted);text-transform:capitalize;}
+  .factortrack{flex:1;height:10px;background:var(--panel3);border-radius:6px;position:relative;overflow:hidden;}
+  .factortrack .mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--line2);}
+  .factorfill{position:absolute;top:0;bottom:0;border-radius:6px;transition:width .5s,left .5s;}
+  .factorfill.up{background:linear-gradient(90deg,#22c55e,#a3e635);}
+  .factorfill.dn{background:linear-gradient(90deg,#f43f5e,#fb923c);}
+  .factorrow .fv{width:38px;text-align:right;font-variant-numeric:tabular-nums;}
+
+  /* Learning panel */
+  .learnstat{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;}
+  .learnstat .box{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 14px;min-width:120px;}
+  .learnstat .box .l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;}
+  .learnstat .box .n{font-size:20px;font-weight:800;font-family:"Consolas",monospace;}
+  .wtable{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px;}
+  .wtable td{padding:6px 8px;border-bottom:1px solid var(--line);}
+  .wtable td:first-child{color:var(--muted);text-transform:capitalize;}
+  .wbar{height:8px;border-radius:5px;background:linear-gradient(90deg,#5b8cff,#22d3ee);}
+  .wtrack{background:var(--panel3);border-radius:5px;height:8px;width:120px;display:inline-block;vertical-align:middle;overflow:hidden;}
+  .edge.pos{color:var(--green);} .edge.neg{color:var(--red);}
+  .learnwarn{font-size:11px;color:var(--gold);margin-top:10px;}
+
+  /* Alerts feed */
+  .alertsfeed{max-height:220px;overflow:auto;}
+  .arow{display:flex;gap:10px;align-items:center;padding:9px 16px;border-bottom:1px solid var(--line);font-size:12px;}
+  .arow .ak{font-weight:800;font-size:10px;padding:2px 7px;border-radius:5px;}
+  .ak.BREAKOUT{background:rgba(34,197,94,.2);color:#7ff0a8;}
+  .ak.INVALIDATED{background:rgba(244,63,94,.18);color:#ff9fae;}
+  .arow .at{color:var(--dim);margin-left:auto;font-size:11px;}
+
+  /* Toolbar row */
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:0 22px 8px;}
+  .toolbar .preset,.toolbar .toggle{background:var(--panel2);border:1px solid var(--line);color:var(--muted);
+    border-radius:20px;padding:6px 13px;font-size:12px;font-weight:600;cursor:pointer;}
+  .toolbar .preset:hover,.toolbar .preset.active{border-color:var(--accent);color:var(--text);}
+  .toolbar .toggle.on{border-color:var(--green);color:#7ff0a8;}
+
+  /* Risk pill */
+  .risk{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;margin-left:6px;}
+  .risk.hi{background:rgba(244,63,94,.16);color:#ff9fae;border:1px solid rgba(244,63,94,.4);}
+  .risk.mid{background:rgba(245,179,1,.15);color:#ffd873;border:1px solid rgba(245,179,1,.35);}
+  .risk.lo{background:rgba(34,197,94,.14);color:#7ff0a8;border:1px solid rgba(34,197,94,.3);}
+
+  /* Watch button + watchlist panel */
+  .watchbtn{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line2);
+    border-radius:10px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;transition:border .15s,background .15s;}
+  .watchbtn:hover{border-color:var(--gold);background:rgba(245,179,1,.08);color:var(--gold);}
+  .watchbtn:disabled{opacity:.7;cursor:default;color:var(--green);border-color:rgba(34,197,94,.4);}
+  .watchpanel{margin:6px 22px 20px;}
+  .watchpanel .phead .btn{background:var(--panel3);border:1px solid var(--line2);color:var(--text);
+    border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;}
+  .watchpanel .phead .btn:hover{border-color:var(--accent);}
+  .wrow{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);font-size:13px;}
+  .wrow:last-child{border-bottom:0;}
+  .wrow .wsym{font-weight:700;min-width:110px;}
+  .wrow .wstat{font-size:11px;font-weight:800;padding:3px 9px;border-radius:20px;}
+  .wstat.BREAKOUT{background:rgba(34,197,94,.18);color:#7ff0a8;animation:glowP 1.6s ease-in-out infinite;}
+  .wstat.WAITING{background:rgba(138,151,173,.16);color:#b9c3d4;}
+  .wstat.INVALIDATED{background:rgba(244,63,94,.16);color:#ff9fae;}
+  .wstat.unknown,.wstat.error{background:var(--panel3);color:var(--muted);}
+  .wrow .wx{margin-left:auto;color:var(--dim);cursor:pointer;font-size:16px;}
+  .wrow .wx:hover{color:var(--red);}
+
+  /* Detail */
+  .detail{padding:16px;}
+  .dhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+  .dhead h2{font-size:22px;margin:0;font-weight:800;}
+  .dscores{display:flex;gap:10px;margin:12px 0;}
+  .dscore{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;}
+  .dscore .l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;}
+  .dscore .n{font-size:22px;font-weight:800;}
+  #chart{width:100%;height:340px;margin:6px 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;}
+  .legend{font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px;}
+  .legend b{font-size:14px;line-height:0;}
+  .plan{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:6px 14px;margin-top:6px;}
+  .plan .row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);align-items:baseline;}
+  .plan .row:last-child{border-bottom:0;}
+  .plan .k{color:var(--muted);font-size:12px;}
+  .plan .v{font-weight:700;font-variant-numeric:tabular-nums;text-align:right;}
+  .plan .trig{color:var(--text);font-size:12.5px;font-weight:500;padding:8px 0;border-bottom:1px solid var(--line);}
+  .kv{display:grid;grid-template-columns:auto auto;gap:6px 16px;margin-top:14px;font-size:13px;}
+  .kv div:nth-child(odd){color:var(--muted);}
+  .kv div:nth-child(even){text-align:right;font-weight:600;font-variant-numeric:tabular-nums;}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:14px;}
+  .chip{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:4px 10px;font-size:11px;color:var(--muted);}
+  .warn{font-size:11px;color:var(--gold);margin-top:14px;line-height:1.55;
+    background:rgba(245,179,1,.08);border:1px solid rgba(245,179,1,.25);border-radius:10px;padding:10px 12px;}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-thumb{background:var(--panel3);border-radius:8px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+
+  /* ====================== SCI-FI / FUTURISTIC LAYER ======================
+     All GPU-friendly CSS (transform/opacity). Runs in the browser only, so
+     it adds ZERO load to the Render server. */
+
+  /* Animated deep-space grid + drifting nebula backdrop */
+  .fx{position:fixed;inset:0;z-index:-2;pointer-events:none;overflow:hidden;}
+  .fx .grid{position:absolute;inset:-50%;
+    background-image:
+      linear-gradient(rgba(91,140,255,.06) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(91,140,255,.06) 1px,transparent 1px);
+    background-size:44px 44px;
+    transform:perspective(500px) rotateX(60deg);
+    transform-origin:center 40%;
+    animation:gridflow 18s linear infinite;}
+  @keyframes gridflow{from{background-position:0 0;}to{background-position:0 44px;}}
+  .fx .neb{position:absolute;width:60vw;height:60vw;border-radius:50%;
+    filter:blur(90px);opacity:.35;mix-blend-mode:screen;}
+  .fx .neb.a{background:radial-gradient(circle,#3b5bdb,transparent 60%);top:-15vw;left:-10vw;animation:drift1 26s ease-in-out infinite;}
+  .fx .neb.b{background:radial-gradient(circle,#7c3aed,transparent 60%);bottom:-20vw;right:-10vw;animation:drift2 32s ease-in-out infinite;}
+  .fx .neb.c{background:radial-gradient(circle,#0891b2,transparent 60%);top:30vh;left:50vw;width:40vw;height:40vw;animation:drift1 40s ease-in-out infinite reverse;}
+  @keyframes drift1{0%,100%{transform:translate(0,0) scale(1);}50%{transform:translate(6vw,4vh) scale(1.15);}}
+  @keyframes drift2{0%,100%{transform:translate(0,0) scale(1);}50%{transform:translate(-5vw,-5vh) scale(1.1);}}
+  .fx .stars{position:absolute;inset:0;
+    background-image:radial-gradient(1px 1px at 20% 30%,#fff,transparent),
+      radial-gradient(1px 1px at 70% 60%,#cfe0ff,transparent),
+      radial-gradient(1px 1px at 40% 80%,#fff,transparent),
+      radial-gradient(1px 1px at 85% 20%,#bcd,transparent),
+      radial-gradient(1px 1px at 55% 45%,#fff,transparent);
+    background-size:340px 340px;opacity:.5;animation:twinkle 5s ease-in-out infinite alternate;}
+  @keyframes twinkle{from{opacity:.25;}to{opacity:.6;}}
+
+  /* Header scan-line sweep + logo glow */
+  header{position:sticky;overflow:hidden;}
+  header::after{content:"";position:absolute;left:0;top:0;height:100%;width:140px;
+    background:linear-gradient(90deg,transparent,rgba(91,140,255,.14),transparent);
+    animation:sweep 6s linear infinite;pointer-events:none;}
+  @keyframes sweep{0%{transform:translateX(-160px);}100%{transform:translateX(100vw);}}
+  .brand .logo{animation:logoglow 3.2s ease-in-out infinite;}
+  @keyframes logoglow{0%,100%{box-shadow:0 0 16px rgba(91,140,255,.45);}50%{box-shadow:0 0 28px rgba(139,92,246,.75);}}
+  .brand h1{background:linear-gradient(90deg,#eaf1ff,#8ab4ff,#c4b5fd,#eaf1ff);
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+    background-size:200% auto;animation:shine 6s linear infinite;}
+  @keyframes shine{to{background-position:200% center;}}
+
+  /* Glowing panels + animated neon top border */
+  .card,.panel{position:relative;}
+  .card{transition:transform .18s, box-shadow .25s, border-color .25s;}
+  .card::before,.panel::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;
+    background:linear-gradient(90deg,transparent,var(--accent),var(--cyan),var(--accent2),transparent);
+    background-size:200% 100%;opacity:.7;animation:borderflow 8s linear infinite;}
+  @keyframes borderflow{to{background-position:200% 0;}}
+  .card:hover{transform:translateY(-3px);border-color:var(--line2);
+    box-shadow:0 10px 30px rgba(91,140,255,.18),0 0 0 1px rgba(91,140,255,.15) inset;}
+  .card .val{font-family:"Consolas","SF Mono",ui-monospace,monospace;
+    text-shadow:0 0 14px rgba(91,140,255,.35);}
+
+  /* Scan button pulse when idle */
+  .scanbtn{position:relative;overflow:hidden;}
+  .scanbtn::after{content:"";position:absolute;inset:0;
+    background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.25),transparent 70%);
+    transform:translateX(-120%);animation:btnshine 3.5s ease-in-out infinite;}
+  @keyframes btnshine{0%,60%{transform:translateX(-120%);}100%{transform:translateX(120%);}}
+
+  /* Regime dot radiating pulse */
+  .regime .dot{position:relative;}
+  .regime.on .dot::after,.regime.off .dot::after,.regime.mixed .dot::after{
+    content:"";position:absolute;inset:-4px;border-radius:50%;border:1px solid currentColor;
+    color:inherit;animation:ping 2s cubic-bezier(0,0,.2,1) infinite;opacity:.6;}
+  .regime.on .dot::after{border-color:var(--green);}
+  .regime.off .dot::after{border-color:var(--red);}
+  .regime.mixed .dot::after{border-color:var(--gold);}
+  @keyframes ping{0%{transform:scale(.8);opacity:.7;}80%,100%{transform:scale(2.4);opacity:0;}}
+
+  /* Tier badges softly glow by class */
+  .tier{position:relative;}
+  .tier.prime{animation:glowP 2.4s ease-in-out infinite;}
+  @keyframes glowP{0%,100%{box-shadow:0 0 0 rgba(34,197,94,0);}50%{box-shadow:0 0 12px rgba(34,197,94,.5);}}
+  .tier.strong{animation:glowS 2.6s ease-in-out infinite;}
+  @keyframes glowS{0%,100%{box-shadow:0 0 0 rgba(91,140,255,0);}50%{box-shadow:0 0 12px rgba(91,140,255,.5);}}
+
+  /* Score bars: animated sweep shimmer + fill transition */
+  .bar{transition:width .8s cubic-bezier(.2,.8,.2,1);position:relative;overflow:hidden;}
+  .bar::after{content:"";position:absolute;inset:0;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent);
+    transform:translateX(-100%);animation:barshine 2.4s ease-in-out infinite;}
+  @keyframes barshine{0%,70%{transform:translateX(-100%);}100%{transform:translateX(100%);}}
+
+  /* Rows fade + slide in as they stream */
+  tbody tr{animation:rowin .4s ease both;}
+  @keyframes rowin{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+  tbody tr:hover{box-shadow:inset 0 0 0 1px rgba(91,140,255,.25);}
+
+  /* SCANNING state: radar overlay + animated progress glow */
+  body.scanning .brand .logo{animation:logoglow 1s ease-in-out infinite;}
+  .progbar.show i{box-shadow:0 0 12px var(--cyan);}
+  .progbar.show{position:relative;}
+  .radar{position:fixed;right:26px;bottom:26px;width:74px;height:74px;border-radius:50%;
+    border:1px solid rgba(91,140,255,.4);display:none;z-index:30;
+    background:radial-gradient(circle,rgba(91,140,255,.08),transparent 70%);}
+  body.scanning .radar{display:block;}
+  .radar::before{content:"";position:absolute;inset:0;border-radius:50%;
+    background:conic-gradient(from 0deg,rgba(34,211,238,.55),transparent 30%);
+    animation:spin 1.4s linear infinite;}
+  .radar::after{content:"";position:absolute;inset:0;border-radius:50%;
+    border:1px solid rgba(34,211,238,.25);animation:ping 2s ease-out infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  /* Panel entrance */
+  .panel{animation:rowin .5s ease both;}
+  .cards .card{animation:rowin .5s ease both;}
+  .cards .card:nth-child(2){animation-delay:.05s;}
+  .cards .card:nth-child(3){animation-delay:.1s;}
+  .cards .card:nth-child(4){animation-delay:.15s;}
+
+  /* Respect users who prefer no motion */
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none !important;transition:none !important;}
+  }
+</style>
+</head>
+<body>
+<div class="fx">
+  <div class="stars"></div>
+  <div class="grid"></div>
+  <div class="neb a"></div>
+  <div class="neb b"></div>
+  <div class="neb c"></div>
+</div>
+<div class="radar" title="scanning..."></div>
+<header>
+  <div class="brand">
+    <div class="logo">&#128640;</div>
+    <div>
+      <h1>Bitget Moonshot Scanner</h1>
+      <div class="sub">early asymmetry &middot; fundamentals &middot; mechanical trade plans</div>
+    </div>
+  </div>
+  <div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+    <div class="regime" id="regime"><span class="dot"></span><span id="regimeTxt">market regime: --</span></div>
+    <div class="session" id="sessionBox"><span class="sicon">&#128337;</span> <span id="sessionTxt">Yerevan session: --</span></div>
+  </div>
+</header>
+
+<div class="controls">
+  <div class="fld"><label>Symbols (comma)</label><input id="symbols" type="text" placeholder="blank = auto discover"/></div>
+  <div class="fld"><label>Auto discover</label><input id="auto" type="number" value="30"/></div>
+  <div class="fld"><label>Min turnover $</label><input id="minTurnover" type="number" value="500000"/></div>
+  <div class="fld"><label>Max turnover $</label><input id="maxTurnover" type="number" value="50000000"/></div>
+  <div class="fld"><label>Min asymmetry</label><input id="minAsym" type="number" value="55"/></div>
+  <div class="fld"><label>Account $</label><input id="account" type="number" value="1000"/></div>
+  <div class="fld"><label>Risk %</label><input id="risk" type="number" value="1.0" step="0.1"/></div>
+  <div class="fld"><label>Fundamentals</label><select id="fund"><option value="1">On</option><option value="0">Off (faster)</option></select></div>
+  <div class="fld"><label>On-chain</label><select id="onchain"><option value="1">On</option><option value="0">Off (faster)</option></select></div>
+  <button class="scanbtn" id="scanBtn">Scan &#9889;</button>
+</div>
+
+<div class="progwrap"><div class="progbar" id="progbar"><i></i></div></div>
+<div class="statusline" id="status">Idle &mdash; set options and press Scan.</div>
+
+<div class="toolbar">
+  <span style="color:var(--muted);font-size:12px">Filter:</span>
+  <span class="preset active" data-f="all">All</span>
+  <span class="preset" data-f="prime">Moonshot hunt</span>
+  <span class="preset" data-f="ready">Breakout ready</span>
+  <span class="preset" data-f="safe">Low liq-risk</span>
+  <span class="preset" data-f="avoid">Show avoids</span>
+  <span style="flex:1"></span>
+  <span class="toggle" id="autoRefresh" title="Auto re-check watchlist every 60s">&#128260; Auto-refresh: off</span>
+  <span class="preset" id="csvBtn">&#11015; Export CSV</span>
+</div>
+
+<div class="marketbar" id="marketBar">
+  <div class="mkt" id="mktBTC"><span class="mname">BTC</span><span class="mval">--</span></div>
+  <div class="mkt" id="mktETH"><span class="mname">ETH</span><span class="mval">--</span></div>
+  <div class="mktnote" id="mktNote">Alts usually follow BTC/ETH. If these are bearish, size down or stay flat.</div>
+</div>
+
+<div class="cards" id="cards">
+  <div class="card"><div class="lbl">Coins found</div><div class="val" id="cCount">0</div></div>
+  <div class="card"><div class="lbl">Prime / strong</div><div class="val" id="cPrime">0</div></div>
+  <div class="card"><div class="lbl">Top asymmetry</div><div class="val small" id="cTop">--</div></div>
+  <div class="card"><div class="lbl">Best avg score</div><div class="val small" id="cBest">--</div></div>
+</div>
+
+<main>
+  <div class="panel">
+    <div class="phead">Ranked candidates <span class="hint">click a row for chart + plan</span></div>
+    <div class="tblwrap">
+      <table id="tbl">
+        <thead><tr>
+          <th data-k="symbol">Coin</th>
+          <th data-k="moonshot_tier">Tier</th>
+          <th data-k="verdict">Verdict</th>
+          <th data-k="asymmetry_score">Asym</th>
+          <th data-k="moonshot_score">Quality</th>
+          <th data-k="confluence">Confl</th>
+          <th data-k="cap_tier">Cap</th>
+          <th data-k="phase">Phase</th>
+          <th data-k="liquidity_risk">Liq risk</th>
+          <th data-k="price">Price</th>
+          <th data-k="change_24h_pct">24h</th>
+          <th data-k="chg_30d_pct">30d</th>
+          <th data-k="rsi_4h">RSI</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty"><div class="big">&#128302;</div>Set your options and press <b>Scan</b>.<br/>Results stream in live as each coin finishes.</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="phead">Detail <span class="hint" id="dhint">no coin selected</span></div>
+    <div class="detail" id="detail">
+      <div class="empty"><div class="big">&#128200;</div>Select a coin to see its candlestick chart with entry / stop / take-profit levels and the full trade plan.</div>
+    </div>
+  </div>
+</main>
+
+<div class="panel watchpanel">
+  <div class="phead">
+    <span>&#9733; Watchlist &amp; breakout alerts <span class="hint">saved picks &mdash; check if they broke their trigger</span></span>
+    <button class="btn" id="checkWatch">Check breakouts &#128226;</button>
+  </div>
+  <div id="watchRows"><div class="empty" style="padding:24px">No coins watched yet. Open a coin and press &ldquo;Add to watchlist&rdquo; to track it for a breakout.</div></div>
+</div>
+
+<div class="panel watchpanel">
+  <div class="phead">
+    <span>&#128226; Alert feed <span class="hint" id="alertChannels">breakout / invalidation events</span></span>
+    <button class="btn" id="refreshAlerts">Refresh</button>
+  </div>
+  <div class="alertsfeed" id="alertRows"><div class="empty" style="padding:20px">No alerts yet. Breakouts and invalidations from watchlist checks appear here.</div></div>
+</div>
+
+<div class="panel watchpanel">
+  <div class="phead">
+    <span>&#129504; Self-learning <span class="hint" id="learnHint">grades its own calls &amp; re-weights factors that predict well</span></span>
+    <button class="btn" id="evalBtn">Evaluate &amp; learn now</button>
+  </div>
+  <div id="learnBody" style="padding:16px">
+    <div class="empty" style="padding:20px">Loading learning stats&hellip;</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let results = [];
+let sortKey = "combined_rank", sortDir = -1;
+let selected = null;
+let chart = null, candleSeries = null;
+let total = 0, done = 0;
+
+const _urlToken = new URLSearchParams(location.search).get("token");
+if (_urlToken) localStorage.setItem("moonshot_token", _urlToken);
+const TOKEN = _urlToken || localStorage.getItem("moonshot_token") || "";
+function withToken(url){ if(!TOKEN) return url; return url + (url.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN); }
+
+function fmtPrice(x){
+  if(x==null||!isFinite(x)) return "-";
+  if(x>=1000) return x.toLocaleString(undefined,{maximumFractionDigits:2});
+  if(x>=1) return x.toFixed(4);
+  if(x>=0.01) return x.toFixed(6);
+  return x.toExponential(2);
+}
+function fmtUsd(x){
+  if(x==null||!isFinite(x)) return "-";
+  const a=Math.abs(x);
+  if(a>=1e9) return "$"+(x/1e9).toFixed(2)+"B";
+  if(a>=1e6) return "$"+(x/1e6).toFixed(2)+"M";
+  if(a>=1e3) return "$"+(x/1e3).toFixed(1)+"K";
+  return "$"+x.toFixed(0);
+}
+function pct(x){ if(x==null||!isFinite(x)) return "-"; return (x>=0?"+":"")+x.toFixed(2)+"%"; }
+function tierClass(t){
+  if(!t) return "low";
+  if(t.includes("PRIME")) return "prime";
+  if(t.includes("STRONG")) return "strong";
+  if(t.includes("SPECULATIVE")) return "spec";
+  if(t.includes("AVOID")) return "avoid";
+  if(t.includes("CHASING")) return "chasing";
+  return "low";
+}
+function scoreBar(v){
+  v = v||0;
+  const cls = v>=70?"hi":v>=45?"mid":"lo";
+  return `<span class="score"><span class="barwrap"><span class="bar ${cls}" style="width:${v}%"></span></span><b>${v}</b></span>`;
+}
+
+function updateCards(){
+  $("cCount").textContent = results.length;
+  const prime = results.filter(r=>{const t=r.moonshot_tier||"";return t.includes("PRIME")||t.includes("STRONG");}).length;
+  $("cPrime").textContent = prime;
+  if(results.length){
+    const top = results.reduce((a,b)=>(b.asymmetry_score||0)>(a.asymmetry_score||0)?b:a);
+    $("cTop").textContent = top.symbol+" ("+(top.asymmetry_score||0)+")";
+    const avg = results.reduce((s,r)=>s+((r.asymmetry_score||0)+(r.moonshot_score||0))/2,0)/results.length;
+    $("cBest").textContent = avg.toFixed(0)+"/100";
+  } else { $("cTop").textContent="--"; $("cBest").textContent="--"; }
+}
+
+function renderTable(){
+  const rows = $("rows");
+  results.sort((a,b)=>{
+    let x=a[sortKey], y=b[sortKey];
+    if(typeof x==="string"||typeof y==="string"){ x=(x||""); y=(y||""); return sortDir*(x<y?-1:x>y?1:0); }
+    x=x==null?-1e18:x; y=y==null?-1e18:y; return sortDir*(x-y);
+  });
+  rows.innerHTML = results.map((r,i)=>{
+    const sel = selected===r.symbol?"selected":"";
+    const c24 = (r.change_24h_pct||0)>=0?"pos":"neg";
+    const c30 = (r.chg_30d_pct||0)>=0?"pos":"neg";
+    return `<tr class="${sel}" data-sym="${r.symbol}">
+      <td class="sym"><span class="rank">#${i+1}</span>${r.symbol}</td>
+      <td><span class="tier ${tierClass(r.moonshot_tier)}">${r.moonshot_tier||"-"}</span></td>
+      <td><span class="verdict ${verdictClass(r.verdict)}">${r.verdict||"-"}</span></td>
+      <td>${scoreBar(r.asymmetry_score)}</td>
+      <td>${scoreBar(r.moonshot_score)}</td>
+      <td>${scoreBar(r.confluence)}</td>
+      <td>${r.cap_tier||"-"}</td>
+      <td>${r.phase||"-"}</td>
+      <td>${r.liquidity_risk&&r.liquidity_risk!=="UNKNOWN"?`<span class="risk ${riskClass(r.liquidity_risk)}">${r.liquidity_risk}</span>`:"-"}</td>
+      <td>${fmtPrice(r.price)}</td>
+      <td class="${c24}">${pct(r.change_24h_pct)}</td>
+      <td class="${c30}">${pct(r.chg_30d_pct)}</td>
+      <td>${r.rsi_4h?r.rsi_4h.toFixed(0):"-"}</td>
+    </tr>`;
+  }).join("");
+  $("empty").style.display = results.length?"none":"block";
+  [...rows.querySelectorAll("tr")].forEach(tr=>{ tr.onclick=()=>selectCoin(tr.dataset.sym); });
+  updateCards();
+}
+
+async function selectCoin(sym){
+  selected = sym; renderTable();
+  const r = results.find(x=>x.symbol===sym);
+  if(!r) return;
+  $("dhint").textContent = r.symbol;
+  const c24=(r.change_24h_pct||0)>=0?"pos":"neg", c30=(r.chg_30d_pct||0)>=0?"pos":"neg";
+  $("detail").innerHTML = `
+    <div class="dhead">
+      <h2>${r.symbol}</h2>
+      <span class="tier ${tierClass(r.moonshot_tier)}">${r.moonshot_tier||"-"}</span>
+      <span class="dir ${r.direction||'NEUTRAL'}">${r.direction||"-"}${r.direction_score!=null?" "+(r.direction_score>0?"+":"")+r.direction_score:""}</span>
+      <span class="muted" style="color:var(--muted)">${r.signal||""}</span>
+    </div>
+    ${disciplineBanner(r)}
+    ${patternChips(r)}
+    <div style="margin:8px 0;padding:12px 14px;border-radius:12px;border:1px solid var(--line);
+      background:linear-gradient(120deg,rgba(91,140,255,.08),transparent)">
+      <span class="verdict ${verdictClass(r.verdict)}" style="font-size:12px">${r.verdict||"-"}</span>
+      <span style="margin-left:8px;color:var(--muted)">confidence ${r.confidence??"-"}% &middot; ${r.factors_agree??0} factors agree</span>
+      <div style="margin-top:6px;font-size:13px">${r.verdict_summary||""}</div>
+    </div>
+    <div class="dscores">
+      <div class="dscore"><div class="l">Asymmetry (room + earliness)</div><div class="n">${r.asymmetry_score??"-"}<span style="font-size:13px;color:var(--muted)">/100</span></div></div>
+      <div class="dscore"><div class="l">Trade quality (setup now)</div><div class="n">${r.moonshot_score??"-"}<span style="font-size:13px;color:var(--muted)">/100</span></div></div>
+      <div class="dscore"><div class="l">Confluence</div><div class="n">${r.confluence??"-"}<span style="font-size:13px;color:var(--muted)">/100</span></div></div>
+    </div>
+    ${factorBreakdown(r)}
+    <div id="chart"></div>
+    <div class="legend">
+      <span><b style="color:#5b8cff">&#9644;</b> entry</span>
+      <span><b style="color:#f43f5e">&#9644;</b> stop</span>
+      <span><b style="color:#22c55e">&#9644;</b> TP1 / TP2</span>
+      <span><b style="color:#f5b301">&#9644;</b> runner</span>
+    </div>
+    <div class="plan">
+      <div class="trig"><b>Entry trigger:</b> ${r.entry_trigger||"-"}</div>
+      <div class="row"><span class="k">Limit buy zone</span><span class="v">${fmtPrice(r.entry_low)} &ndash; ${fmtPrice(r.entry_high)}</span></div>
+      <div class="row"><span class="k">Stop (invalidation)</span><span class="v neg">${fmtPrice(r.stop)} ${r.stop_pct?("&nbsp;-"+r.stop_pct.toFixed(1)+"%"):""}</span></div>
+      <div class="row"><span class="k">TP1 &mdash; sell ${r.tp1_sell_pct||40}%</span><span class="v pos">${fmtPrice(r.tp1)} &nbsp;RR ${r.rr_tp1?r.rr_tp1.toFixed(2):"-"}</span></div>
+      <div class="row"><span class="k">TP2 &mdash; sell ${r.tp2_sell_pct||35}%</span><span class="v pos">${fmtPrice(r.tp2)} &nbsp;RR ${r.rr_tp2?r.rr_tp2.toFixed(2):"-"}</span></div>
+      <div class="row"><span class="k">Runner &mdash; ride ${r.runner_sell_pct||25}%</span><span class="v" style="color:var(--gold)">${fmtPrice(r.runner)}+</span></div>
+      <div class="row"><span class="k">Position size</span><span class="v">${fmtUsd(r.position_notional_usd)} &nbsp;<span style="color:var(--muted);font-weight:500">(risk ${fmtUsd(r.risk_budget_usd)})</span></span></div>
+    </div>
+    <div class="kv">
+      <div>Market cap</div><div>${fmtUsd(r.market_cap_usd)} <span style="color:var(--muted)">(${r.cap_tier||"-"})</span></div>
+      <div>FDV / mcap</div><div>${r.fdv_mcap_ratio?r.fdv_mcap_ratio.toFixed(1)+"x":"-"}</div>
+      <div>Circulating</div><div>${r.circulating_pct?r.circulating_pct.toFixed(0)+"%":"-"}</div>
+      <div>Below ATH</div><div>${r.down_from_ath_pct?r.down_from_ath_pct.toFixed(0)+"%":"-"}</div>
+      <div>Phase</div><div>${r.phase||"-"} <span style="color:var(--muted)">(accum ${r.accumulation_score?r.accumulation_score.toFixed(0):"-"})</span></div>
+      <div>Vol wake-up</div><div>${r.vol_wakeup_ratio?r.vol_wakeup_ratio.toFixed(2)+"x":"-"}</div>
+      <div>On-chain early</div><div>${r.onchain_ok?((r.early_onchain!=null?r.early_onchain.toFixed(0):"-")+"/100 <span style='color:var(--muted)'>["+(r.dex_chain||"?")+"]</span>"):"<span style='color:var(--muted)'>no DEX data</span>"}</div>
+      <div>DEX liquidity</div><div>${r.onchain_ok?fmtUsd(r.dex_liquidity_usd):"-"} ${r.liquidity_risk&&r.liquidity_risk!=="UNKNOWN"?`<span class="risk ${riskClass(r.liquidity_risk)}">${r.liquidity_risk} risk</span>`:""}</div>
+      <div>DEX buy-flow</div><div>${r.dex_buy_sell_ratio_h1!=null?(r.dex_buy_sell_ratio_h1*100).toFixed(0)+"% 1h":"-"} ${r.dex_pair_age_days!=null?"&middot; age "+r.dex_pair_age_days.toFixed(0)+"d":""}</div>
+      <div>24h / 30d</div><div><span class="${c24}">${pct(r.change_24h_pct)}</span> / <span class="${c30}">${pct(r.chg_30d_pct)}</span></div>
+      <div>Backtest</div><div>${r.bt_trades||0}t &middot; WR ${r.bt_win_rate_pct?r.bt_win_rate_pct.toFixed(0)+"%":"-"} &middot; ${r.bt_expectancy_r!=null?r.bt_expectancy_r.toFixed(2)+"R":"-"} <span style="color:var(--muted)">[${r.bt_reliability||"NONE"}]</span></div>
+    </div>
+    <div style="margin-top:14px"><button class="watchbtn" id="watchBtn">&#9734; Add to watchlist &amp; alert on breakout</button></div>
+    <div class="chips">${(r.reasons||"").split(" | ").filter(Boolean).slice(0,16).map(x=>`<span class="chip">${x}</span>`).join("")}</div>
+    <div class="warn">&#9888; Asymmetry is upside <i>room</i>, NOT probability. Nano/micro caps are illiquid and can go to zero on unlocks, exploits or delistings. Size every bet as money you can fully lose. Backtest is net of fees; samples under 12 trades are noise.</div>
+  `;
+  const wb = document.getElementById("watchBtn");
+  if(wb) wb.onclick=()=>addWatch(r);
+  drawChart(r);
+}
+
+function riskClass(x){ if(!x)return""; if(x==="EXTREME"||x==="HIGH")return "hi"; if(x==="MEDIUM")return "mid"; return "lo"; }
+function disciplineBanner(r){
+  let ws=[]; try{ ws=JSON.parse(r.discipline_warnings||"[]"); }catch(e){}
+  const stance=r.discipline_stance||"OK to plan";
+  const cls = r.is_chase?"chase":(ws.length?"caution":"ok");
+  const head = r.is_chase? "&#128721; DO NOT CHASE" : (ws.length? "&#9888; Caution" : "&#9989; OK to plan a disciplined entry");
+  const lev = `<div style="margin-top:6px">Suggested leverage: <b>${r.max_leverage_suggested||1}x</b> &mdash; ${r.leverage_note||"keep it low"}</div>`;
+  const list = ws.length? `<ul>${ws.map(w=>`<li>${w}</li>`).join("")}</ul>`:"";
+  return `<div class="disc ${cls}"><b>${head}</b>${list}${lev}</div>`;
+}
+function patternChips(r){
+  let ps=[]; try{ ps=JSON.parse(r.patterns||"[]"); }catch(e){}
+  if(!ps.length) return "";
+  return `<div style="margin:4px 0 8px">${ps.map(p=>`<span class="patchip ${p.direction}" title="${p.why||''}">${p.name}</span>`).join("")}</div>`;
+}
+async function loadMarket(){
+  try{
+    const r=await fetch(withToken("/api/market")); const d=await r.json();
+    for(const [sym,el] of [["BTCUSDT","mktBTC"],["ETHUSDT","mktETH"]]){
+      const m=d[sym]||{}; const box=$(el); if(!box) return;
+      const bull=m.above_ema200 && (m.trend_4h||0)>=2;
+      box.className="mkt "+(bull?"bull":((m.change_24h_pct||0)<0?"bear":""));
+      const c=(m.change_24h_pct||0)>=0?"pos":"neg";
+      box.innerHTML=`<span class="mname">${sym.replace("USDT","")}</span>
+        <span class="mval">${fmtPrice(m.price)}</span>
+        <span class="${c}">${pct(m.change_24h_pct)}</span>
+        <span class="muted" style="color:var(--muted);font-size:11px">RSI ${m.rsi_4h?m.rsi_4h.toFixed(0):"-"} · trend ${m.trend_4h??"-"}/3</span>`;
+    }
+    const reg=(d.regime||{}).label||"--";
+    $("mktNote").textContent = `Regime: ${reg}. Alts follow BTC/ETH — if these turn down, size down or stay flat.`;
+  }catch(e){}
+}
+function verdictClass(v){
+  if(!v) return "neutral";
+  if(v.includes("STRONG")) return "strong";
+  if(v.includes("BUY")) return "buy";
+  if(v.includes("AVOID")) return "avoid";
+  return "neutral";
+}
+function factorBreakdown(r){
+  let fs={}, fw={};
+  try{ fs = JSON.parse(r.factor_scores||"{}"); }catch(e){ return ""; }
+  try{ fw = JSON.parse(r.factor_weights||"{}"); }catch(e){ fw={}; }
+  const rows = Object.entries(fs).map(([k,v])=>{
+    const val = Math.max(-100,Math.min(100,v||0));
+    const up = val>=0;
+    const w = Math.abs(val)/2; // half-width max 50%
+    const left = up? 50 : 50-w;
+    const wt = fw[k]!=null? fw[k] : 1;
+    const wtag = Math.abs(wt-1)>0.03 ? `<span style="color:${wt>1?'#7ff0a8':'#ff9fae'};font-size:10px">×${wt.toFixed(2)}</span>` : "";
+    return `<div class="factorrow"><span class="fl">${k} ${wtag}</span>
+      <span class="factortrack"><span class="mid"></span>
+        <span class="factorfill ${up?'up':'dn'}" style="left:${left}%;width:${w}%"></span></span>
+      <span class="fv ${up?'pos':'neg'}">${val>0?"+":""}${val.toFixed(0)}</span></div>`;
+  }).join("");
+  return `<div class="factors"><div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Factor confluence (each &minus;100&hellip;+100) &middot; ×weight = learned</div>${rows}</div>`;
+}
+
+async function addWatch(r){
+  const body = {symbol:r.symbol, trigger:r.trigger_level, entry_low:r.entry_low, entry_high:r.entry_high,
+    stop:r.stop, tp1:r.tp1, phase:r.phase, moonshot_tier:r.moonshot_tier};
+  try{
+    await fetch(withToken("/api/watch"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    // local backup
+    const w = JSON.parse(localStorage.getItem("moonshot_watch")||"{}"); w[r.symbol]=body; localStorage.setItem("moonshot_watch",JSON.stringify(w));
+    loadWatch();
+    const wb=document.getElementById("watchBtn"); if(wb){wb.textContent="\u2605 Added to watchlist"; wb.disabled=true;}
+  }catch(e){}
+}
+
+async function drawChart(r){
+  const el = $("chart"); if(!el) return;
+  chart = LightweightCharts.createChart(el, {
+    layout:{ background:{color:"#0c111c"}, textColor:"#8a97ad", fontFamily:"Segoe UI, sans-serif" },
+    grid:{ vertLines:{color:"#161f33"}, horzLines:{color:"#161f33"} },
+    rightPriceScale:{ borderColor:"#26314a" },
+    timeScale:{ borderColor:"#26314a", timeVisible:true },
+    crosshair:{ mode:0 },
+    height:340,
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor:"#22c55e", downColor:"#f43f5e", borderVisible:false,
+    wickUpColor:"#22c55e", wickDownColor:"#f43f5e",
+  });
+  try{
+    const resp = await fetch(withToken(`/api/candles?symbol=${encodeURIComponent(r.symbol)}&interval=4H&limit=200`));
+    const data = await resp.json();
+    if(data.candles){
+      candleSeries.setData(data.candles.map(c=>({time:c.time,open:c.open,high:c.high,low:c.low,close:c.close})));
+      const lines = [
+        {price:r.entry_mid||((r.entry_low+r.entry_high)/2), color:"#5b8cff", title:"Entry"},
+        {price:r.stop, color:"#f43f5e", title:"Stop"},
+        {price:r.tp1, color:"#22c55e", title:"TP1"},
+        {price:r.tp2, color:"#22c55e", title:"TP2"},
+        {price:r.runner, color:"#f5b301", title:"Runner"},
+      ];
+      lines.forEach(l=>{ if(l.price&&isFinite(l.price)) candleSeries.createPriceLine({
+        price:l.price, color:l.color, lineWidth:1, lineStyle:2, axisLabelVisible:true, title:l.title }); });
+      chart.timeScale().fitContent();
+      new ResizeObserver(()=>chart.applyOptions({width:el.clientWidth})).observe(el);
+    }
+  }catch(e){}
+}
+
+$("tbl").querySelectorAll("th").forEach(th=>{
+  th.onclick=()=>{ const k=th.dataset.k; if(sortKey===k) sortDir*=-1; else {sortKey=k; sortDir=-1;} renderTable(); };
+});
+
+function setRegime(reg){
+  const el=$("regime"); el.className="regime";
+  const lab=(reg.label||"").toUpperCase();
+  if(lab.includes("ON")) el.classList.add("on");
+  else if(lab.includes("OFF")) el.classList.add("off");
+  else el.classList.add("mixed");
+  $("regimeTxt").textContent = `BTC regime: ${reg.label||"--"} (${reg.score||0}/4, RSI ${reg.rsi?reg.rsi.toFixed(0):"-"})`;
+}
+
+async function scan(){
+  results=[]; selected=null; done=0; total=0; renderTable();
+  $("detail").innerHTML='<div class="empty"><div class="big">&#8987;</div>Scanning&hellip; results appear here as coins finish.</div>';
+  $("dhint").textContent="no coin selected";
+  $("progbar").classList.add("show"); $("progbar").firstElementChild.style.width="0%";
+  const q = new URLSearchParams({
+    symbols:$("symbols").value.trim(), auto:$("auto").value,
+    min_turnover:$("minTurnover").value, max_turnover:$("maxTurnover").value,
+    min_asymmetry:$("minAsym").value, account:$("account").value,
+    risk:$("risk").value, fundamentals:$("fund").value, onchain:$("onchain").value,
+  });
+  $("scanBtn").disabled=true; $("status").textContent="Starting&hellip;";
+  document.body.classList.add("scanning");
+  try{
+    const resp = await fetch(withToken("/api/scan?"+q.toString()));
+    if(resp.status===401){ $("status").textContent="Unauthorized \u2014 add ?token=YOUR_TOKEN to the URL"; $("scanBtn").disabled=false; $("progbar").classList.remove("show"); return; }
+    const reader = resp.body.getReader(); const dec=new TextDecoder(); let buf="";
+    while(true){
+      const {value,done:rd} = await reader.read(); if(rd) break;
+      buf += dec.decode(value,{stream:true});
+      let nl;
+      while((nl=buf.indexOf("\n"))>=0){
+        const line=buf.slice(0,nl).trim(); buf=buf.slice(nl+1); if(!line) continue;
+        const msg=JSON.parse(line);
+        if(msg.type==="regime"){ setRegime(msg.regime); }
+        else if(msg.type==="start"){ total=msg.count; $("status").textContent=`Scanning ${total} coins\u2026`; }
+        else if(msg.type==="result"){ done++; results.push(msg.data); renderTable(); tick(); }
+        else if(msg.type==="skip"){ done++; tick(msg.symbol+" filtered out"); }
+        else if(msg.type==="error"){ done++; tick("skipped "+msg.symbol); }
+        else if(msg.type==="done"){ $("status").textContent=`Done \u2014 ${results.length} coins ranked.`; $("progbar").firstElementChild.style.width="100%";
+          setTimeout(()=>$("progbar").classList.remove("show"),800);
+          if(results.length && !selected) selectCoin(results[0].symbol); }
+      }
+    }
+  }catch(e){ $("status").textContent="Error: "+e.message; $("progbar").classList.remove("show"); }
+  $("scanBtn").disabled=false;
+  document.body.classList.remove("scanning");
+}
+function tick(extra){
+  const p = total? Math.round(done/total*100):0;
+  $("progbar").firstElementChild.style.width=p+"%";
+  $("status").textContent=`${done}/${total} analyzed \u00b7 ${results.length} shown${extra?" \u00b7 "+extra:""}`;
+}
+$("scanBtn").onclick=scan;
+
+// ---------------- Watchlist ----------------
+async function loadWatch(){
+  let items=[];
+  try{ const r=await fetch(withToken("/api/watch")); const d=await r.json(); items=d.items||[]; }
+  catch(e){ const w=JSON.parse(localStorage.getItem("moonshot_watch")||"{}"); items=Object.values(w); }
+  renderWatch(items.map(it=>({...it, status:"WAITING"})));
+}
+function renderWatch(items){
+  const el=$("watchRows");
+  if(!items.length){ el.innerHTML='<div class="empty" style="padding:24px">No coins watched yet. Open a coin and press &ldquo;Add to watchlist&rdquo; to track it for a breakout.</div>'; return; }
+  el.innerHTML = items.map(it=>{
+    const st=(it.status||"WAITING");
+    const near = it.to_trigger_pct!=null? ` &middot; ${it.to_trigger_pct>=0?"+":""}${it.to_trigger_pct.toFixed(1)}% to trigger`:"";
+    const px = it.price!=null? "px "+fmtPrice(it.price):"";
+    return `<div class="wrow">
+      <span class="wsym">${it.symbol}</span>
+      <span class="wstat ${st}">${st}</span>
+      <span style="color:var(--muted)">trigger ${fmtPrice(it.trigger)} ${px}${near}</span>
+      ${it.tier?`<span class="tier ${tierClass(it.tier)}">${it.tier}</span>`:""}
+      <span class="wx" title="remove" data-sym="${it.symbol}">&#10005;</span>
+    </div>`;
+  }).join("");
+  [...el.querySelectorAll(".wx")].forEach(x=>x.onclick=()=>removeWatch(x.dataset.sym));
+}
+async function removeWatch(sym){
+  try{ await fetch(withToken("/api/watch"),{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({symbol:sym})}); }catch(e){}
+  const w=JSON.parse(localStorage.getItem("moonshot_watch")||"{}"); delete w[sym]; localStorage.setItem("moonshot_watch",JSON.stringify(w));
+  loadWatch();
+}
+async function checkWatch(){
+  $("checkWatch").textContent="Checking\u2026"; $("checkWatch").disabled=true;
+  try{
+    const r=await fetch(withToken("/api/watch/check")); const d=await r.json();
+    renderWatch(d.items||[]);
+    const hits=(d.items||[]).filter(i=>i.status==="BREAKOUT");
+    if(hits.length){ $("checkWatch").textContent=`\u{1F4E2} ${hits.length} breakout!`; }
+    else { $("checkWatch").textContent="Check breakouts \u{1F4E2}"; }
+  }catch(e){ $("checkWatch").textContent="Check breakouts \u{1F4E2}"; }
+  $("checkWatch").disabled=false;
+}
+$("checkWatch").onclick=checkWatch;
+
+// ---------------- Filters ----------------
+let activeFilter="all";
+function applyFilter(){
+  [...document.querySelectorAll(".preset[data-f]")].forEach(p=>p.classList.toggle("active",p.dataset.f===activeFilter));
+  renderTable();
+}
+function passesFilter(r){
+  switch(activeFilter){
+    case "prime": { const t=r.moonshot_tier||""; return t.includes("PRIME")||t.includes("STRONG")||t.includes("SPECULATIVE"); }
+    case "ready": return (r.phase==="EARLY_BREAKOUT"||r.phase==="COILED_EARLY") && (r.verdict||"").includes("BUY") || (r.verdict||"").includes("STRONG");
+    case "safe": return r.liquidity_risk==="LOW"||r.liquidity_risk==="MEDIUM"||!r.onchain_ok;
+    case "avoid": return true;
+    default: return true;
+  }
+}
+[...document.querySelectorAll(".preset[data-f]")].forEach(p=>p.onclick=()=>{ activeFilter=p.dataset.f; applyFilter(); });
+
+// hook filtering into renderTable via a wrapper
+const _renderTableBase = renderTable;
+renderTable = function(){
+  const all = results;
+  const shown = (activeFilter==="all") ? all : all.filter(passesFilter);
+  // temporarily swap
+  const saved = results; results = shown; _renderTableBase(); results = saved;
+};
+
+// ---------------- CSV export ----------------
+$("csvBtn").onclick=()=>{
+  if(!results.length) return;
+  const cols=["symbol","verdict","moonshot_tier","asymmetry_score","moonshot_score","confluence","confidence","cap_tier","phase","liquidity_risk","price","change_24h_pct","chg_30d_pct","rsi_4h","entry_low","entry_high","stop","tp1","tp2","runner"];
+  const rows=[cols.join(",")].concat(results.map(r=>cols.map(c=>{const v=r[c];return v==null?"":(""+v).replace(/,/g," ");}).join(",")));
+  const blob=new Blob([rows.join("\n")],{type:"text/csv"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="moonshot_scan.csv"; a.click();
+};
+
+// ---------------- Alerts feed ----------------
+async function loadAlerts(){
+  try{
+    const r=await fetch(withToken("/api/alerts")); const d=await r.json();
+    const ch=d.channels||{};
+    $("alertChannels").textContent = `telegram ${ch.telegram?"on":"off"} · webhook ${ch.webhook?"on":"off"}${d.autoscan_min>0?` · auto-scan ${d.autoscan_min}m`:""}`;
+    const ev=d.events||[];
+    const el=$("alertRows");
+    if(!ev.length){ el.innerHTML='<div class="empty" style="padding:20px">No alerts yet. Breakouts and invalidations from watchlist checks appear here.</div>'; return; }
+    el.innerHTML=ev.map(e=>`<div class="arow"><span class="ak ${e.kind}">${e.kind}</span>
+      <b>${e.symbol}</b> <span style="color:var(--muted)">${e.kind==="BREAKOUT"?("broke "+fmtPrice(e.trigger)+" @ "+fmtPrice(e.price)):("hit stop "+fmtPrice(e.stop)+" @ "+fmtPrice(e.price))}</span>
+      <span class="at">${(e.ts||"").replace("T"," ").slice(0,16)}</span></div>`).join("");
+  }catch(e){}
+}
+$("refreshAlerts").onclick=loadAlerts;
+
+// ---------------- Auto-refresh ----------------
+let autoTimer=null;
+$("autoRefresh").onclick=()=>{
+  const el=$("autoRefresh");
+  if(autoTimer){ clearInterval(autoTimer); autoTimer=null; el.classList.remove("on"); el.innerHTML="&#128260; Auto-refresh: off"; }
+  else { el.classList.add("on"); el.innerHTML="&#128260; Auto-refresh: on"; autoTimer=setInterval(()=>{checkWatch(); loadAlerts();},60000); checkWatch(); loadAlerts(); }
+};
+
+// ---------------- Self-learning ----------------
+function sessionBlock(sessions){
+  const keys=Object.keys(sessions||{});
+  if(!keys.length) return `<div class="muted" style="font-size:11px;margin-top:12px">Per-session hit-rate (Yerevan) appears here once calls mature &mdash; this verifies whether your observed time-of-day pattern really holds.</div>`;
+  const rows=keys.map(k=>{
+    const b=sessions[k]; const hr=b.hit_rate!=null?(b.hit_rate*100).toFixed(0)+"%":"--";
+    const w=b.hit_rate!=null?Math.round(b.hit_rate*100):0;
+    const cls=w>=55?"up":w>=40?"":"dn";
+    return `<div class="factorrow"><span class="fl" style="width:210px">${k}</span>
+      <span class="factortrack"><span class="factorfill ${cls||'up'}" style="left:0;width:${w/2}%"></span></span>
+      <span class="fv">${hr} <span style="color:var(--dim)">(${b.n})</span></span></div>`;
+  }).join("");
+  return `<div class="factors"><div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 4px">Hit-rate by Yerevan session &mdash; is your pattern real?</div>${rows}</div>`;
+}
+async function loadLearn(){
+  try{
+    const r=await fetch(withToken("/api/learn/stats")); const d=await r.json();
+    const st=d.stats||{}; const w=d.weights||{};
+    const hr=st.hit_rate!=null?(st.hit_rate*100).toFixed(0)+"%":"--";
+    const graded=st.graded||0; const pending=st.pending||0;
+    const enough=graded>=(d.min_samples||15);
+    const edges=st.edges||{};
+    // weight rows
+    const wr=Object.keys(w).map(k=>{
+      const val=w[k]||1; const pctw=Math.min(100,val/1.8*100);
+      const e=edges[k]?edges[k].edge:null;
+      const ecls=e>0?"pos":e<0?"neg":"";
+      return `<tr><td>${k}</td>
+        <td><span class="wtrack"><span class="wbar" style="width:${pctw}%"></span></span> <b>${val.toFixed(2)}x</b></td>
+        <td class="edge ${ecls}">${e==null?"-":(e>0?"+":"")+e.toFixed(2)}</td>
+        <td style="color:var(--muted)">${edges[k]?("n+ "+edges[k].n_pos+" / n- "+edges[k].n_neg):""}</td></tr>`;
+    }).join("");
+    $("learnBody").innerHTML=`
+      <div class="learnstat">
+        <div class="box"><div class="l">Calls graded</div><div class="n">${graded}</div></div>
+        <div class="box"><div class="l">Hit rate</div><div class="n">${hr}</div></div>
+        <div class="box"><div class="l">Pending</div><div class="n">${pending}</div></div>
+        <div class="box"><div class="l">Total journaled</div><div class="n">${d.total_predictions||0}</div></div>
+      </div>
+      <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Learned factor weights &amp; measured edge</div>
+      <table class="wtable"><tr><td style="color:var(--muted)">factor</td><td style="color:var(--muted)">weight</td><td style="color:var(--muted)">edge</td><td></td></tr>${wr}</table>
+      ${sessionBlock(st.sessions||{})}
+      ${enough?"":`<div class="learnwarn">&#9888; Only ${graded}/${d.min_samples} graded calls so far. Weights stay near neutral until there is real evidence &mdash; this is honest, not broken. It learns as calls mature (${d.horizon_hours}h horizon, +${d.hit_threshold_pct}% = hit).</div>`}
+    `;
+  }catch(e){ $("learnBody").innerHTML='<div class="empty" style="padding:20px">Learning stats unavailable.</div>'; }
+}
+$("evalBtn").onclick=async ()=>{
+  $("evalBtn").textContent="Evaluating\u2026"; $("evalBtn").disabled=true;
+  try{ await fetch(withToken("/api/learn/evaluate"),{method:"POST"}); await loadLearn(); }catch(e){}
+  $("evalBtn").textContent="Evaluate & learn now"; $("evalBtn").disabled=false;
+};
+
+// ---------------- Yerevan session ----------------
+async function loadSession(){
+  try{
+    const r=await fetch(withToken("/api/session")); const d=await r.json();
+    const sc=d.session_score||0;
+    const cls = sc>=40?"hi":sc>=0?"mid":"lo";
+    const fav = sc>=40?"favorable":sc>=0?"neutral":"weak";
+    $("sessionTxt").innerHTML = `Yerevan ${d.session_hour_yerevan!=null?String(Math.floor(d.session_hour_yerevan)).padStart(2,"0")+":00":""} &middot; ${d.session_label||"--"} <span class="sfav ${cls}">${fav}</span>`;
+  }catch(e){}
+}
+
+loadWatch();
+loadAlerts();
+loadLearn();
+loadSession();
+loadMarket();
+setInterval(loadSession, 5*60000);
+setInterval(loadMarket, 5*60000);
+</script>
+</body>
+</html>
+"""
+
+
+def _lan_ip() -> str:
+    """Best-effort local network IP (the 192.168.x.x style address)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # no packets sent; just picks the route
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+# Start the background scheduler at import time so it also runs under waitress /
+# gunicorn on Render (not only via __main__). No-op unless MOONSHOT_AUTOSCAN_MIN>0.
+_start_scheduler_once()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Moonshot Scanner web dashboard")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MOONSHOT_HOST", "127.0.0.1"),
+        help="Bind address. 127.0.0.1 = this PC only; 0.0.0.0 = reachable on your network",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("PORT", os.environ.get("MOONSHOT_PORT", "5000"))),
+        help="Port (default 5000, or $PORT when hosted)",
+    )
+    parser.add_argument(
+        "--token",
+        default=ACCESS_TOKEN,
+        help="Require this access token on all data requests (recommended when public)",
+    )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        default=os.environ.get("MOONSHOT_DEV", "") == "1",
+        help="Force Flask's dev server instead of waitress",
+    )
+    args = parser.parse_args()
+
+    ACCESS_TOKEN = args.token.strip()  # noqa: F811 (intentional module rebind)
+    globals()["ACCESS_TOKEN"] = ACCESS_TOKEN
+
+    lan = _lan_ip()
+    print("=" * 66)
+    print(" Bitget Moonshot Scanner — Web Dashboard")
+    print("=" * 66)
+    print(f" This device      : http://127.0.0.1:{args.port}")
+    if args.host == "0.0.0.0":
+        url = f"http://{lan}:{args.port}"
+        if ACCESS_TOKEN:
+            url += f"/?token={ACCESS_TOKEN}"
+        print(f" Other devices    : {url}")
+        print("   (they must be on the same network, or use a tunnel for public access)")
+    else:
+        print(" Bind             : 127.0.0.1 (local only)")
+        print("   To allow other devices:  set MOONSHOT_HOST=0.0.0.0  then restart")
+    if ACCESS_TOKEN:
+        print(f" Access token     : required (?token={ACCESS_TOKEN})")
+    else:
+        print(" Access token     : none (anyone who can reach the URL can scan)")
+    print(" Stop             : Ctrl+C")
+    print("=" * 66)
+
+    served = False
+    if not args.dev:
+        try:
+            from waitress import serve
+            print(" Server: waitress (production)")
+            serve(app, host=args.host, port=args.port, threads=8)
+            served = True
+        except ImportError:
+            print(" Server: waitress not installed, falling back to Flask dev server.")
+            print("         (pip install waitress  for a sturdier server)")
+
+    if not served:
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)

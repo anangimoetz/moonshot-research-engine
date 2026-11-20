@@ -1,0 +1,41 @@
+# Render deployment blueprint for the Bitget Moonshot Scanner web dashboard.
+# Render reads this file automatically when you create a service from the repo.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: bitget-moonshot-scanner
+    runtime: python
+    plan: free                     # free tier: sleeps after ~15 min idle, wakes on next visit
+    region: oregon                 # change if you prefer (frankfurt, singapore, etc.)
+    buildCommand: pip install -r requirements_moonshot.txt
+    # waitress is a production WSGI server that runs the Flask app object.
+    # $PORT is provided by Render; 0.0.0.0 makes it reachable.
+    startCommand: waitress-serve --host=0.0.0.0 --port=$PORT moonshot_web:app
+    autoDeploy: true               # redeploy automatically on git push
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: MOONSHOT_TOKEN        # protects the API; set a real value in the dashboard
+        sync: false                # 'sync:false' => you enter the secret in Render, not in git
+      # ---- Optional: breakout alerts + background auto-scan ----
+      # Fill these in the Render dashboard (Environment tab) to enable them.
+      - key: MOONSHOT_TELEGRAM_TOKEN   # Telegram bot token (from @BotFather)
+        sync: false
+      - key: MOONSHOT_TELEGRAM_CHAT    # your Telegram chat/user id
+        sync: false
+      - key: MOONSHOT_WEBHOOK          # optional generic webhook URL for alerts
+        sync: false
+      - key: MOONSHOT_AUTOSCAN_MIN     # minutes between background scans (0=off)
+        value: "0"
+      - key: MOONSHOT_AUTOSCAN_N       # how many coins the background scan checks
+        value: "25"
+      # ---- Optional: FREE PERMANENT LEARNING via GitHub (survives redeploys) ----
+      # See LEARNING_PERSISTENCE.md for how to make the fine-grained token.
+      - key: MOONSHOT_GH_TOKEN         # fine-grained PAT, Contents read+write on the repo
+        sync: false
+      - key: MOONSHOT_GH_REPO          # e.g. andreluciano69/bitget-moonshot-scanner
+        sync: false
+      - key: MOONSHOT_GH_PATH          # where to store state in the repo
+        value: "learn_state/moonshot_learn.json"
+      - key: MOONSHOT_GH_BRANCH
+        value: "main"

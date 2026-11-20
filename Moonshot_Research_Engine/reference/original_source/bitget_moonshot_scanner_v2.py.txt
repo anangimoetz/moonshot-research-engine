@@ -1,0 +1,3710 @@
+#!/usr/bin/env python3
+"""
+BITGET MOONSHOT SCANNER v2.0
+============================
+
+A no-API-key crypto market scanner for Bitget.
+
+LIVE DATA LAYERS
+- Spot multi-timeframe price action: 1H / 4H / 1D
+- EMA 20 / 50 / 200
+- RSI 14
+- MACD 12/26/9
+- ATR 14
+- Relative volume + turnover
+- Dynamic support / resistance
+- BTC market regime
+- Futures Open Interest (current) + locally persisted OI delta
+- Current + historical funding rate
+- Futures order-book imbalance
+- Recent futures taker-flow imbalance
+- Liquidation-pressure proxy
+- Automatic historical backtest of the price/volume core setup
+- Automatic USDT candidate discovery
+- Moonshot Score 0-100
+- Watch zone / invalidation / TP1 / TP2
+- CSV + JSON export
+
+WHY "LIQUIDATION PROXY" INSTEAD OF EXACT LIQUIDATIONS?
+Bitget public market endpoints expose futures ticker/OI/funding, order books,
+recent fills and candles, but not an exchange-wide public liquidation tape
+that this no-key scanner can reliably query. Therefore this scanner estimates
+liquidation pressure using OI contraction + sharp price movement + aggressive
+taker flow + volume/wick shock. It is explicitly labelled as a proxy.
+
+BACKTEST LIMITATION
+The automatic backtest uses historical price/volume indicators. Current
+order-book depth and locally tracked OI delta are NOT retrospectively injected
+into old candles. This avoids pretending we possess historical data that the
+public endpoint does not provide.
+
+No model can guarantee a future price move. Treat this as a screening and
+risk-management tool, not as a guaranteed prediction engine.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+
+
+# ---------------------------------------------------------------------------
+# Console encoding (Windows-safe)
+# ---------------------------------------------------------------------------
+# On Windows the console often defaults to a legacy code page (e.g. cp1252)
+# that cannot encode characters such as the Greek delta ("Δ") or an em dash
+# ("—") used in this program's output. Reconfigure stdout/stderr to UTF-8 so
+# the detailed per-symbol report prints instead of raising UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://api.bitget.com"
+
+CANDLES_EP = "/api/v3/market/candles"
+TICKERS_EP = "/api/v3/market/tickers"
+ORDERBOOK_EP = "/api/v3/market/orderbook"
+FILLS_EP = "/api/v3/market/fills"
+
+# Bitget Classic public endpoint; still useful for funding history.
+FUNDING_HISTORY_EP = "/api/v2/mix/market/history-fund-rate"
+
+# CoinGecko free (no-key) API for fundamentals: market cap, FDV, supply, age.
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_LIST_CACHE = ".moonshot_cg_list.json"
+COINGECKO_LIST_TTL_SEC = 24 * 3600  # refresh symbol->id map once per day
+
+# DexScreener free (no-key) API for on-chain / DEX early signals:
+# real liquidity depth, DEX volume, buy/sell pressure, pair age, new listings.
+DEXSCREENER_BASE = "https://api.dexscreener.com"
+
+DEFAULT_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "MYXUSDT", "SUIUSDT", "APTUSDT"
+]
+
+TIMEFRAMES = {
+    "1H": 360,
+    "4H": 1000,  # also used by the automatic backtest
+    "1D": 360,
+}
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "BitgetMoonshotScanner/2.0",
+    "Accept": "application/json",
+})
+
+REQUEST_SLEEP = 0.06
+DEFAULT_STATE_FILE = ".moonshot_oi_state.json"
+
+# Reliability: retry transient failures (429/5xx/timeouts) with backoff, and
+# cache GET responses briefly so heavy scans do not re-hit the same endpoint
+# and trip rate limits. All in-process; safe for a single-worker server.
+HTTP_MAX_RETRIES = 3
+HTTP_BACKOFF_BASE = 0.8      # seconds; grows 0.8, 1.6, 3.2 ...
+_HTTP_CACHE: Dict[str, Tuple[float, Any]] = {}
+
+
+def _cache_get(key: str, ttl: float) -> Any:
+    hit = _HTTP_CACHE.get(key)
+    if hit is None:
+        return None
+    ts, val = hit
+    if (time.time() - ts) <= ttl:
+        return val
+    return None
+
+
+def _cache_put(key: str, val: Any) -> None:
+    _HTTP_CACHE[key] = (time.time(), val)
+    # Keep the cache from growing unbounded during long-running servers.
+    if len(_HTTP_CACHE) > 4000:
+        for k in list(_HTTP_CACHE.keys())[:1000]:
+            _HTTP_CACHE.pop(k, None)
+
+
+def http_get_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 15,
+    cache_ttl: float = 0.0,
+    retries: int = HTTP_MAX_RETRIES,
+) -> Any:
+    """
+    GET returning parsed JSON, with retry/backoff on transient errors and an
+    optional short-lived response cache. Raises the last error if all retries
+    fail so callers can degrade gracefully.
+    """
+    cache_key = None
+    if cache_ttl > 0:
+        cache_key = url + "?" + json.dumps(params or {}, sort_keys=True)
+        cached = _cache_get(cache_key, cache_ttl)
+        if cached is not None:
+            return cached
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max(1, retries)):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            # Retry on rate-limit / server errors.
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            data = r.json()
+            if cache_key:
+                _cache_put(cache_key, data)
+            return data
+        except Exception as e:  # noqa: BLE001 - deliberate broad transient catch
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(HTTP_BACKOFF_BASE * (2 ** attempt))
+    raise last_err if last_err else RuntimeError("http_get_json failed")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def yerevan_hour(ts_ms: Optional[int] = None) -> float:
+    """Hour of day (0-23.99) in Yerevan time (UTC+4, no DST)."""
+    t = (ts_ms if ts_ms is not None else now_ms()) / 1000.0
+    utc = datetime.fromtimestamp(t, tz=timezone.utc)
+    h = (utc.hour + utc.minute / 60.0 + YEREVAN_UTC_OFFSET_H) % 24
+    return h
+
+
+def session_profile(ts_ms: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Classify the current Yerevan-time window into a market session and give a
+    time-of-day favorability score (-100..100). This starts from the user's
+    observed pattern (post-midnight surge, morning consolidation/dip, afternoon
+    run driven by the London+US overlap) but is treated as a HYPOTHESIS: the
+    learning loop measures hit-rate per session and can down-weight it if the
+    pattern does not hold for real picks.
+
+    Yerevan is UTC+4. Rough Western session mapping:
+      - London opens ~11:00 Yerevan, US opens ~16:30-17:30 Yerevan,
+        London+US overlap ~17:00-20:00 Yerevan (typically the most active).
+    """
+    h = yerevan_hour(ts_ms)
+
+    if 0 <= h < 4:
+        label, score = "post-midnight surge", 55        # user-observed surge
+    elif 4 <= h < 8:
+        label, score = "late-night wind-down", -10
+    elif 8 <= h < 12:
+        label, score = "morning consolidation", -25      # user-observed dip/chop
+    elif 12 <= h < 16:
+        label, score = "midday build-up", 20
+    elif 16 <= h < 20:
+        label, score = "afternoon run (London+US overlap)", 60  # user-observed run
+    else:  # 20-24
+        label, score = "US session evening", 25
+
+    return {
+        "session_hour_yerevan": round(h, 2),
+        "session_label": label,
+        "session_score": score,
+    }
+
+
+def sf(value: Any, default: float = np.nan) -> float:
+    try:
+        x = float(value)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def pct(a: float, b: float) -> float:
+    """Percent change from b to a."""
+    if not np.isfinite(a) or not np.isfinite(b) or b == 0:
+        return np.nan
+    return (a / b - 1.0) * 100.0
+
+
+def fmt_price(x: float) -> str:
+    if not np.isfinite(x):
+        return "-"
+    if x >= 1000:
+        return f"{x:,.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    if x >= 0.01:
+        return f"{x:.6f}"
+    return f"{x:.10f}"
+
+
+def get_json(
+    endpoint: str,
+    params: Dict[str, Any],
+    timeout: int = 15,
+    cache_ttl: float = 0.0,
+) -> Dict[str, Any]:
+    payload = http_get_json(BASE_URL + endpoint, params, timeout, cache_ttl=cache_ttl)
+    if payload.get("code") != "00000":
+        raise RuntimeError(
+            f"Bitget API error endpoint={endpoint} params={params}: {payload}"
+        )
+    return payload
+
+
+def symbol_clean(symbol: str) -> str:
+    return symbol.upper().replace("/", "").replace("-", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Learning loop — journal predictions, grade real outcomes, tune factor weights
+# ---------------------------------------------------------------------------
+# Honest, transparent machine learning without a black box:
+#   1) JOURNAL every real call with a snapshot of the factor scores that drove
+#      it, plus the reference price and the target/stop levels.
+#   2) EVALUATE matured calls against real price action -> HIT / MISS / EXPIRED.
+#   3) LEARN: for each factor, measure whether it leaned the right way on hits
+#      vs misses, then nudge that factor's weight up (reliable) or down
+#      (misleading). Weights are bounded and only move once there is a real
+#      sample, so a couple of unlucky trades can't wreck the model.
+#
+# Everything is stored in one JSON file so it survives restarts (on Render's
+# ephemeral disk it resets on redeploy — the design tolerates that and simply
+# relearns; for permanence, point LEARN_STORE at a mounted disk).
+
+LEARN_STORE = os.environ.get("MOONSHOT_LEARN_STORE", ".moonshot_learn.json")
+# Free permanent storage: persist the learning file to a GitHub repo so it
+# survives Render redeploys/sleeps. Set these env vars to enable (all optional):
+#   MOONSHOT_GH_TOKEN  = fine-grained PAT with contents:read/write on the repo
+#   MOONSHOT_GH_REPO   = "owner/repo" (e.g. andreluciano69/bitget-moonshot-scanner)
+#   MOONSHOT_GH_PATH   = path in repo (default "learn_state/moonshot_learn.json")
+#   MOONSHOT_GH_BRANCH = branch (default "main")
+GH_TOKEN = os.environ.get("MOONSHOT_GH_TOKEN", "").strip()
+GH_REPO = os.environ.get("MOONSHOT_GH_REPO", "").strip()
+GH_PATH = os.environ.get("MOONSHOT_GH_PATH", "learn_state/moonshot_learn.json").strip()
+GH_BRANCH = os.environ.get("MOONSHOT_GH_BRANCH", "main").strip()
+_GH_SHA: Optional[str] = None          # cached file sha for updates
+LEARN_HORIZON_HOURS = 72.0          # how long a prediction has to work out
+LEARN_HIT_PCT = 8.0                 # +8% from ref before stop = HIT
+LEARN_MIN_SAMPLES = 15              # need this many graded calls before weights move
+LEARN_RATE = 0.06                   # how fast weights adapt (small = stable)
+FACTOR_KEYS = ["technical", "structure", "onchain", "derivatives", "market", "backtest", "session"]
+
+# Yerevan timezone (UTC+4, no DST) for session-of-day awareness.
+YEREVAN_UTC_OFFSET_H = 4
+
+_LEARN_MEM: Optional[Dict[str, Any]] = None
+_learn_lock_note = "single-process; callers should serialize writes if threaded"
+
+
+def _default_learn() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "weights": {k: 1.0 for k in FACTOR_KEYS},   # multipliers, start neutral
+        "predictions": [],                           # journaled calls
+        "stats": {},                                 # last computed summary
+    }
+
+
+def _gh_enabled() -> bool:
+    return bool(GH_TOKEN and GH_REPO)
+
+
+def _gh_load() -> Optional[Dict[str, Any]]:
+    """Fetch the learning JSON from GitHub. Returns dict or None on any issue."""
+    global _GH_SHA
+    if not _gh_enabled():
+        return None
+    try:
+        import base64
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+        r = SESSION.get(
+            url,
+            params={"ref": GH_BRANCH},
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "Accept": "application/vnd.github+json"},
+            timeout=15,
+        )
+        if r.status_code == 404:
+            _GH_SHA = None
+            return None
+        r.raise_for_status()
+        payload = r.json()
+        _GH_SHA = payload.get("sha")
+        content = base64.b64decode(payload.get("content", "")).decode("utf-8")
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def _gh_save(d: Dict[str, Any]) -> bool:
+    """Commit the learning JSON back to GitHub (create or update)."""
+    global _GH_SHA
+    if not _gh_enabled():
+        return False
+    try:
+        import base64
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+        body = {
+            "message": f"moonshot learning update {utc_now_iso()}",
+            "content": base64.b64encode(
+                json.dumps(d, ensure_ascii=False, indent=2).encode("utf-8")
+            ).decode("ascii"),
+            "branch": GH_BRANCH,
+        }
+        if _GH_SHA:
+            body["sha"] = _GH_SHA
+        r = SESSION.put(
+            url,
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "Accept": "application/vnd.github+json"},
+            json=body,
+            timeout=15,
+        )
+        if r.status_code in (200, 201):
+            _GH_SHA = r.json().get("content", {}).get("sha")
+            return True
+        # sha conflict -> refresh and retry once
+        if r.status_code == 409:
+            _gh_load()
+            if _GH_SHA:
+                body["sha"] = _GH_SHA
+                r2 = SESSION.put(url, headers={"Authorization": f"Bearer {GH_TOKEN}",
+                                 "Accept": "application/vnd.github+json"}, json=body, timeout=15)
+                return r2.status_code in (200, 201)
+        return False
+    except Exception:
+        return False
+
+
+def load_learn(path: Optional[Path] = None) -> Dict[str, Any]:
+    global _LEARN_MEM
+    if _LEARN_MEM is not None:
+        return _LEARN_MEM
+
+    # 1) Prefer GitHub-persisted state (survives Render restarts, free).
+    gh = _gh_load()
+    if gh is not None:
+        base = _default_learn()
+        base.update({k: gh[k] for k in ("weights", "predictions", "stats") if k in gh})
+        for k in FACTOR_KEYS:
+            base["weights"].setdefault(k, 1.0)
+        _LEARN_MEM = base
+        return _LEARN_MEM
+
+    # 2) Fall back to local file.
+    p = Path(path or LEARN_STORE)
+    if not p.exists():
+        _LEARN_MEM = _default_learn()
+        return _LEARN_MEM
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        base = _default_learn()
+        base.update({k: d[k] for k in ("weights", "predictions", "stats") if k in d})
+        for k in FACTOR_KEYS:
+            base["weights"].setdefault(k, 1.0)
+        _LEARN_MEM = base
+    except Exception:
+        _LEARN_MEM = _default_learn()
+    return _LEARN_MEM
+
+
+def save_learn(d: Dict[str, Any], path: Optional[Path] = None) -> None:
+    p = Path(path or LEARN_STORE)
+    d["predictions"] = d.get("predictions", [])[-2000:]   # cap journal size
+    # Always keep a local copy (fast + offline fallback).
+    try:
+        p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    # Persist to GitHub for permanence (best-effort, non-blocking on failure).
+    if _gh_enabled():
+        _gh_save(d)
+    global _LEARN_MEM
+    _LEARN_MEM = d
+
+
+def learned_weights(path: Optional[Path] = None) -> Dict[str, float]:
+    """Current per-factor weight multipliers (default 1.0 each)."""
+    return dict(load_learn(path).get("weights", {k: 1.0 for k in FACTOR_KEYS}))
+
+
+def journal_prediction(
+    symbol: str,
+    verdict: str,
+    factor_scores: Dict[str, float],
+    ref_price: float,
+    tp1: float,
+    stop: float,
+    asym: int,
+    quality: int,
+    confluence: int,
+    session_label: Optional[str] = None,
+    path: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    Record a real, actionable call so its outcome can be graded later. Only
+    bullish calls are journaled (that is what the scanner is 'predicting').
+    Returns the prediction id, or None if not a gradable call.
+    """
+    if not verdict or "BUY" not in verdict.upper():
+        return None
+    if not np.isfinite(ref_price) or ref_price <= 0:
+        return None
+    d = load_learn(path)
+    ts = now_ms()
+    pid = f"{symbol_clean(symbol)}-{ts}"
+    sess = session_profile(ts)
+    d.setdefault("predictions", []).append({
+        "id": pid,
+        "symbol": symbol_clean(symbol),
+        "ts": ts,
+        "verdict": verdict,
+        "factor_scores": {k: sf(factor_scores.get(k), 0.0) for k in FACTOR_KEYS},
+        "ref_price": float(ref_price),
+        "tp1": float(tp1) if np.isfinite(tp1) else np.nan,
+        "stop": float(stop) if np.isfinite(stop) else np.nan,
+        "asym": int(asym),
+        "quality": int(quality),
+        "confluence": int(confluence),
+        "session_label": session_label or sess["session_label"],
+        "session_hour": sess["session_hour_yerevan"],
+        "outcome": "PENDING",
+        "realized_pct": None,
+        "graded_ts": None,
+    })
+    save_learn(d, path)
+    return pid
+
+
+def evaluate_predictions(price_lookup, path: Optional[Path] = None) -> Dict[str, int]:
+    """
+    Grade PENDING predictions using a price_lookup(symbol)->current_price fn.
+
+    HIT     : rose >= LEARN_HIT_PCT from ref before hitting stop.
+    MISS    : fell to/through stop (or -LEARN_HIT_PCT if no stop) first.
+    EXPIRED : neither within LEARN_HORIZON_HOURS -> graded on net move sign.
+    Still PENDING otherwise.
+    """
+    d = load_learn(path)
+    counts = {"HIT": 0, "MISS": 0, "EXPIRED": 0, "PENDING": 0}
+    now = now_ms()
+    for p in d.get("predictions", []):
+        if p.get("outcome") != "PENDING":
+            continue
+        sym = p["symbol"]
+        ref = sf(p.get("ref_price"))
+        stop = sf(p.get("stop"))
+        try:
+            price = sf(price_lookup(sym))
+        except Exception:
+            price = np.nan
+        if not np.isfinite(price) or not np.isfinite(ref) or ref <= 0:
+            counts["PENDING"] += 1
+            continue
+
+        chg_pct = (price / ref - 1.0) * 100.0
+        age_h = (now - int(p.get("ts", now))) / 3600000.0
+        hit_stop = np.isfinite(stop) and stop > 0 and price <= stop
+        stop_pct = -LEARN_HIT_PCT if not (np.isfinite(stop) and stop > 0) else (stop / ref - 1.0) * 100.0
+
+        outcome = None
+        if chg_pct >= LEARN_HIT_PCT:
+            outcome = "HIT"
+        elif hit_stop or chg_pct <= stop_pct:
+            outcome = "MISS"
+        elif age_h >= LEARN_HORIZON_HOURS:
+            outcome = "EXPIRED"
+
+        if outcome:
+            p["outcome"] = outcome
+            p["realized_pct"] = round(chg_pct, 2)
+            p["graded_ts"] = now
+            counts[outcome] += 1
+        else:
+            counts["PENDING"] += 1
+
+    save_learn(d, path)
+    return counts
+
+
+def _factor_edge(preds: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    """
+    For each factor, measure how well its sign predicted the outcome across
+    graded calls. Edge = P(hit | factor was positive) - P(hit | factor negative),
+    roughly. Returns per-factor {edge, n_pos, n_neg, hit_rate_pos, hit_rate_neg}.
+    """
+    graded = [p for p in preds if p.get("outcome") in ("HIT", "MISS", "EXPIRED")]
+    out: Dict[str, Dict[str, float]] = {}
+    for k in FACTOR_KEYS:
+        pos_hits = pos_tot = neg_hits = neg_tot = 0
+        for p in graded:
+            fv = sf(p.get("factor_scores", {}).get(k), 0.0)
+            win = 1 if p.get("outcome") == "HIT" else 0
+            if fv > 12:
+                pos_tot += 1
+                pos_hits += win
+            elif fv < -12:
+                neg_tot += 1
+                neg_hits += win
+        hr_pos = (pos_hits / pos_tot) if pos_tot else np.nan
+        hr_neg = (neg_hits / neg_tot) if neg_tot else np.nan
+        if np.isfinite(hr_pos) and np.isfinite(hr_neg):
+            edge = hr_pos - hr_neg
+        elif np.isfinite(hr_pos):
+            edge = hr_pos - 0.5
+        else:
+            edge = 0.0
+        out[k] = {
+            "edge": round(edge, 3),
+            "n_pos": pos_tot, "n_neg": neg_tot,
+            "hit_rate_pos": None if not np.isfinite(hr_pos) else round(hr_pos, 3),
+            "hit_rate_neg": None if not np.isfinite(hr_neg) else round(hr_neg, 3),
+        }
+    return out
+
+
+def _session_stats(preds: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Hit-rate by Yerevan session across graded calls, so the user can see whether
+    their observed time-of-day pattern actually holds for real picks.
+    """
+    graded = [p for p in preds if p.get("outcome") in ("HIT", "MISS", "EXPIRED")]
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for p in graded:
+        lab = p.get("session_label", "unknown")
+        b = buckets.setdefault(lab, {"n": 0, "hits": 0})
+        b["n"] += 1
+        if p.get("outcome") == "HIT":
+            b["hits"] += 1
+    for lab, b in buckets.items():
+        b["hit_rate"] = round(b["hits"] / b["n"], 3) if b["n"] else None
+    return buckets
+
+
+def learn_from_outcomes(path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Recompute per-factor edge and nudge factor weights toward what has actually
+    been predicting well. Bounded to [0.4, 1.8] so no single factor dominates,
+    and gated by LEARN_MIN_SAMPLES so weights only move on real evidence.
+    """
+    d = load_learn(path)
+    preds = d.get("predictions", [])
+    graded = [p for p in preds if p.get("outcome") in ("HIT", "MISS", "EXPIRED")]
+    hits = sum(1 for p in graded if p.get("outcome") == "HIT")
+    n = len(graded)
+
+    edges = _factor_edge(preds)
+    weights = d.get("weights", {k: 1.0 for k in FACTOR_KEYS})
+
+    updated = False
+    if n >= LEARN_MIN_SAMPLES:
+        for k in FACTOR_KEYS:
+            e = edges.get(k, {}).get("edge", 0.0)
+            # Positive edge -> increase weight, negative -> decrease. Scaled so a
+            # strong +0.3 edge moves the weight by ~LEARN_RATE*fullscale.
+            target = clamp(1.0 + e * 2.0, 0.4, 1.8)
+            weights[k] = round(clamp(weights[k] + (target - weights[k]) * LEARN_RATE, 0.4, 1.8), 4)
+        updated = True
+
+    stats = {
+        "graded": n,
+        "hits": hits,
+        "hit_rate": round(hits / n, 3) if n else None,
+        "pending": sum(1 for p in preds if p.get("outcome") == "PENDING"),
+        "edges": edges,
+        "sessions": _session_stats(preds),
+        "weights_updated": updated,
+        "min_samples": LEARN_MIN_SAMPLES,
+        "updated_ts": utc_now_iso(),
+    }
+    d["weights"] = weights
+    d["stats"] = stats
+    save_learn(d, path)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Bitget data
+# ---------------------------------------------------------------------------
+
+def fetch_candles(
+    symbol: str,
+    interval: str,
+    limit: int = 300,
+    category: str = "SPOT",
+) -> pd.DataFrame:
+    payload = get_json(
+        CANDLES_EP,
+        {
+            "category": category,
+            "symbol": symbol_clean(symbol),
+            "interval": interval,
+            "type": "market",
+            "limit": min(int(limit), 1000),
+        },
+        cache_ttl=90.0,   # candles rarely change intra-scan; cache 90s
+    )
+
+    rows = payload.get("data", [])
+    if not rows:
+        raise RuntimeError(f"No candles: {symbol} {interval} {category}")
+
+    df = pd.DataFrame(
+        rows,
+        columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+    )
+
+    for c in ["timestamp", "open", "high", "low", "close", "volume", "turnover"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = (
+        df.dropna()
+          .sort_values("timestamp")
+          .drop_duplicates("timestamp")
+          .reset_index(drop=True)
+    )
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
+    if len(df) < 80:
+        raise RuntimeError(
+            f"Not enough candles for {symbol} {interval}: {len(df)}"
+        )
+
+    return df
+
+
+def fetch_ticker(symbol: str, category: str) -> Dict[str, Any]:
+    payload = get_json(
+        TICKERS_EP,
+        {"category": category, "symbol": symbol_clean(symbol)},
+    )
+    data = payload.get("data", [])
+    if not data:
+        raise RuntimeError(f"No ticker: {symbol} {category}")
+    return data[0]
+
+
+def fetch_all_spot_tickers() -> List[Dict[str, Any]]:
+    payload = get_json(TICKERS_EP, {"category": "SPOT"}, cache_ttl=60.0)
+    return payload.get("data", [])
+
+
+def fetch_orderbook(
+    symbol: str,
+    category: str = "USDT-FUTURES",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    payload = get_json(
+        ORDERBOOK_EP,
+        {
+            "category": category,
+            "symbol": symbol_clean(symbol),
+            "limit": min(int(limit), 1000),
+        },
+    )
+    return payload.get("data", {}) or {}
+
+
+def fetch_recent_fills(
+    symbol: str,
+    category: str = "USDT-FUTURES",
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    payload = get_json(
+        FILLS_EP,
+        {
+            "category": category,
+            "symbol": symbol_clean(symbol),
+            "limit": min(int(limit), 100),
+        },
+    )
+    return payload.get("data", []) or []
+
+
+def fetch_funding_history(symbol: str, page_size: int = 30) -> List[Dict[str, Any]]:
+    payload = get_json(
+        FUNDING_HISTORY_EP,
+        {
+            "symbol": symbol_clean(symbol),
+            "productType": "usdt-futures",
+            "pageSize": min(int(page_size), 100),
+            "pageNo": 1,
+        },
+    )
+    return payload.get("data", []) or []
+
+
+# ---------------------------------------------------------------------------
+# Fundamentals (CoinGecko free API, no key)
+# ---------------------------------------------------------------------------
+# Fundamentals for microcaps are mostly: how small is the cap, how much supply
+# is still locked/uncirculated (FDV vs mcap), how old is the coin, and what
+# category/narrative it belongs to. None of this is available from Bitget's
+# public market endpoints, so we enrich from CoinGecko's free tier.
+#
+# This layer is best-effort. If CoinGecko is rate-limited or the coin is not
+# mapped, every field degrades to NaN/None and scoring falls back to neutral.
+
+_CG_LIST_MEM: Optional[Dict[str, str]] = None
+_CG_RESOLVE_MEM: Dict[str, Optional[str]] = {}
+
+
+def _cg_get(path: str, params: Dict[str, Any], timeout: int = 20) -> Any:
+    # CoinGecko fundamentals move slowly; cache 5 min to spare the rate limit.
+    return http_get_json(COINGECKO_BASE + path, params, timeout, cache_ttl=300.0)
+
+
+def resolve_coingecko_id(base: str, fallback_map: Dict[str, str]) -> Optional[str]:
+    """
+    Resolve a ticker (e.g. "BTC") to the CORRECT CoinGecko id.
+
+    Ticker collisions are rampant: dozens of junk tokens use the symbol "BTC".
+    The static /coins/list gives no ranking, so a naive match can label Bitcoin
+    as a nano-cap copycat. The /search endpoint returns exact-symbol matches
+    ordered by market_cap_rank, so the top exact-symbol hit is the real asset.
+    We use /search first, then fall back to the static map only if search fails.
+    """
+    base = base.upper().strip()
+    if base in _CG_RESOLVE_MEM:
+        return _CG_RESOLVE_MEM[base]
+
+    resolved: Optional[str] = None
+    try:
+        data = _cg_get("/search", {"query": base})
+        coins = data.get("coins", []) if isinstance(data, dict) else []
+        best_rank = None
+        for c in coins:
+            if str(c.get("symbol", "")).upper().strip() != base:
+                continue
+            rank = c.get("market_cap_rank")
+            cid = str(c.get("id", "")).strip()
+            if not cid:
+                continue
+            # Prefer the lowest (best) market cap rank; unranked = worst.
+            rank_val = rank if isinstance(rank, (int, float)) else 10**9
+            if best_rank is None or rank_val < best_rank:
+                best_rank = rank_val
+                resolved = cid
+    except Exception:
+        resolved = None
+
+    if not resolved:
+        resolved = fallback_map.get(base)
+
+    _CG_RESOLVE_MEM[base] = resolved
+    return resolved
+
+
+def load_coingecko_map(cache_path: Path) -> Dict[str, str]:
+    """
+    Returns a {UPPER_SYMBOL: coingecko_id} map. Cached on disk for a day.
+
+    A symbol can map to many CoinGecko ids (ticker collisions are common).
+    We keep the FIRST id seen, which after sorting by id length tends to be
+    the canonical/original project rather than a copycat. This is heuristic;
+    fundamentals are treated as supporting context, not ground truth.
+    """
+    global _CG_LIST_MEM
+    if _CG_LIST_MEM is not None:
+        return _CG_LIST_MEM
+
+    # Try cache first.
+    if cache_path.exists():
+        try:
+            age = time.time() - cache_path.stat().st_mtime
+            if age <= COINGECKO_LIST_TTL_SEC:
+                data = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data:
+                    _CG_LIST_MEM = data
+                    return data
+        except Exception:
+            pass
+
+    mapping: Dict[str, str] = {}
+    try:
+        rows = _cg_get("/coins/list", {"include_platform": "false"})
+        # Shorter ids first so canonical projects win over "-2", "-token" forks.
+        for row in sorted(rows, key=lambda z: len(str(z.get("id", "")))):
+            sym = str(row.get("symbol", "")).upper().strip()
+            cid = str(row.get("id", "")).strip()
+            if sym and cid and sym not in mapping:
+                mapping[sym] = cid
+    except Exception:
+        mapping = {}
+
+    if mapping:
+        try:
+            cache_path.write_text(
+                json.dumps(mapping, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    _CG_LIST_MEM = mapping
+    return mapping
+
+
+def base_asset(symbol: str) -> str:
+    """SOLUSDT -> SOL. Handles common quote suffixes."""
+    s = symbol_clean(symbol)
+    for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return s[: -len(quote)]
+    return s
+
+
+def empty_fundamentals() -> Dict[str, Any]:
+    return {
+        "cg_id": None,
+        "market_cap_usd": np.nan,
+        "fdv_usd": np.nan,
+        "market_cap_rank": np.nan,
+        "circ_supply": np.nan,
+        "total_supply": np.nan,
+        "max_supply": np.nan,
+        "circulating_pct": np.nan,   # circulating / max (or total) supply
+        "fdv_mcap_ratio": np.nan,    # FDV / mcap; high => big unlock overhang
+        "ath_usd": np.nan,
+        "ath_change_pct": np.nan,    # % from ATH (negative = below ATH)
+        "down_from_ath_pct": np.nan, # positive number: how far below ATH
+        "chg_7d_pct": np.nan,
+        "chg_30d_pct": np.nan,
+        "age_days": np.nan,
+        "fundamentals_ok": False,
+    }
+
+
+def fetch_fundamentals(
+    symbol: str,
+    cache_path: Path,
+    ref_price: float = np.nan,
+) -> Dict[str, Any]:
+    """
+    Fetch fundamentals for `symbol`. `ref_price` is the Bitget spot price used
+    as a sanity cross-check: if CoinGecko's price for the resolved coin diverges
+    wildly from Bitget's, the ticker match is almost certainly wrong (a copycat
+    token sharing the symbol) and we discard it rather than report garbage.
+    """
+    out = empty_fundamentals()
+    mapping = load_coingecko_map(cache_path)
+
+    base = base_asset(symbol)
+    cid = resolve_coingecko_id(base, mapping)
+    if not cid:
+        return out
+
+    out["cg_id"] = cid
+
+    try:
+        rows = _cg_get(
+            "/coins/markets",
+            {
+                "vs_currency": "usd",
+                "ids": cid,
+                "price_change_percentage": "7d,30d",
+            },
+        )
+        if not rows:
+            return out
+        m = rows[0]
+    except Exception:
+        return out
+
+    # Cross-check price against Bitget to reject wrong ticker matches.
+    cg_price = sf(m.get("current_price"))
+    if np.isfinite(ref_price) and ref_price > 0 and np.isfinite(cg_price) and cg_price > 0:
+        ratio = cg_price / ref_price
+        if ratio < 0.2 or ratio > 5.0:
+            # Prices disagree by >5x: not the same asset. Abort fundamentals.
+            out["cg_id"] = None
+            return out
+
+    mcap = sf(m.get("market_cap"))
+    fdv = sf(m.get("fully_diluted_valuation"))
+    circ = sf(m.get("circulating_supply"))
+    total = sf(m.get("total_supply"))
+    mx = sf(m.get("max_supply"))
+    ath = sf(m.get("ath"))
+    ath_chg = sf(m.get("ath_change_percentage"))
+
+    out["market_cap_usd"] = mcap
+    out["fdv_usd"] = fdv
+    out["market_cap_rank"] = sf(m.get("market_cap_rank"))
+    out["circ_supply"] = circ
+    out["total_supply"] = total
+    out["max_supply"] = mx
+    out["ath_usd"] = ath
+    out["ath_change_pct"] = ath_chg
+    out["down_from_ath_pct"] = abs(ath_chg) if np.isfinite(ath_chg) and ath_chg < 0 else 0.0
+    out["chg_7d_pct"] = sf(m.get("price_change_percentage_7d_in_currency"))
+    out["chg_30d_pct"] = sf(m.get("price_change_percentage_30d_in_currency"))
+
+    denom = mx if np.isfinite(mx) and mx > 0 else total
+    if np.isfinite(circ) and np.isfinite(denom) and denom > 0:
+        out["circulating_pct"] = clamp(circ / denom * 100.0, 0, 100)
+
+    if np.isfinite(fdv) and np.isfinite(mcap) and mcap > 0:
+        out["fdv_mcap_ratio"] = fdv / mcap
+
+    # Age via ATL date is unreliable; use genesis-ish proxy from markets is not
+    # provided, so age remains NaN unless a detailed call is made. We keep the
+    # scanner fast and skip the heavier /coins/{id} call by default.
+    out["fundamentals_ok"] = True
+    return out
+
+
+def fundamentals_assessment(f: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Turns raw fundamentals into a moonshot-oriented read.
+
+    Core idea: asymmetry is largest when the market cap is still small enough
+    to physically 10x-100x, supply overhang (FDV/mcap) is not extreme, and the
+    coin is not already near its all-time high.
+    """
+    mcap = sf(f.get("market_cap_usd"))
+    fdv_ratio = sf(f.get("fdv_mcap_ratio"))
+    circ_pct = sf(f.get("circulating_pct"))
+    down_ath = sf(f.get("down_from_ath_pct"))
+
+    notes: List[str] = []
+
+    # Cap tier — smaller cap = more room to run (also more risk).
+    if not np.isfinite(mcap) or mcap <= 0:
+        cap_tier = "UNKNOWN"
+        headroom_x = np.nan
+    elif mcap < 5_000_000:
+        cap_tier = "NANO"       # < $5M
+        headroom_x = 100
+        notes.append("nano-cap: extreme upside room + extreme risk")
+    elif mcap < 30_000_000:
+        cap_tier = "MICRO"      # $5M - $30M
+        headroom_x = 30
+        notes.append("micro-cap: high upside room")
+    elif mcap < 150_000_000:
+        cap_tier = "SMALL"      # $30M - $150M
+        headroom_x = 10
+        notes.append("small-cap: moderate upside room")
+    elif mcap < 1_000_000_000:
+        cap_tier = "MID"
+        headroom_x = 4
+    else:
+        cap_tier = "LARGE"
+        headroom_x = 2
+        notes.append("large-cap: a 100x is not realistic")
+
+    # Supply overhang — big FDV vs mcap means heavy future unlocks (sell pressure).
+    if np.isfinite(fdv_ratio):
+        if fdv_ratio >= 10:
+            notes.append(f"heavy unlock overhang FDV/mcap {fdv_ratio:.1f}x")
+        elif fdv_ratio >= 3:
+            notes.append(f"notable unlock overhang FDV/mcap {fdv_ratio:.1f}x")
+
+    if np.isfinite(circ_pct) and circ_pct < 25:
+        notes.append(f"only {circ_pct:.0f}% of supply circulating")
+
+    # Distance from ATH — coins basing far below ATH can round-trip; already
+    # near ATH means the easy discovery move may be gone.
+    if np.isfinite(down_ath):
+        if down_ath >= 80:
+            notes.append(f"{down_ath:.0f}% below ATH (deep value or dead)")
+        elif down_ath <= 5:
+            notes.append("at/near all-time high")
+
+    return {
+        "cap_tier": cap_tier,
+        "headroom_x": headroom_x,
+        "fund_notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# On-chain / DEX signals (DexScreener free API, no key)
+# ---------------------------------------------------------------------------
+# CEX candles tell you what already happened on Bitget. The earliest, biggest
+# moves usually START on-chain: a token gets DEX liquidity, buy pressure and
+# volume ramp before it trends on a centralized exchange. DexScreener exposes
+# per-pair liquidity, rolling volume, buy/sell counts and pair age with no key.
+#
+# Two big uses here:
+#   1) Early signal — rising DEX volume + buy-dominant flow on a young pair.
+#   2) Rug/liquidity risk — thin liquidity vs mcap, or sell-dominant dumping.
+#
+# Ticker collisions are rampant on-chain (many scam tokens reuse symbols), so
+# we keep only pairs whose BASE symbol exactly matches and rank by liquidity;
+# the deepest legit pool is treated as the reference and volume is aggregated.
+
+_DEX_MEM: Dict[str, Dict[str, Any]] = {}
+
+
+def _dex_get(path: str, timeout: int = 15) -> Any:
+    # DEX aggregates update every few minutes; cache 3 min.
+    return http_get_json(DEXSCREENER_BASE + path, None, timeout, cache_ttl=180.0)
+
+
+def empty_onchain() -> Dict[str, Any]:
+    return {
+        "onchain_ok": False,
+        "dex_liquidity_usd": np.nan,
+        "dex_vol_h24": np.nan,
+        "dex_vol_h1": np.nan,
+        "dex_buy_sell_ratio_h24": np.nan,   # buys/(buys+sells) over 24h
+        "dex_buy_sell_ratio_h1": np.nan,
+        "dex_price_change_h24": np.nan,
+        "dex_price_change_h1": np.nan,
+        "dex_pair_age_days": np.nan,
+        "dex_pairs": 0,
+        "dex_chain": None,
+        "liquidity_mcap_ratio": np.nan,     # liq / mcap; very low => thin/risky
+        "vol_liq_ratio_h24": np.nan,        # 24h vol / liquidity; churn intensity
+    }
+
+
+def fetch_onchain(symbol: str, mcap_usd: float = np.nan) -> Dict[str, Any]:
+    """
+    Aggregate DexScreener pairs whose base symbol exactly matches `symbol`'s
+    base asset. Returns liquidity, rolling DEX volume, buy/sell pressure and
+    pair age. Best-effort; degrades to empty on any failure.
+    """
+    base = base_asset(symbol)
+    if base in _DEX_MEM:
+        return _DEX_MEM[base]
+
+    out = empty_onchain()
+    try:
+        data = _dex_get(f"/latest/dex/search?q={base}")
+        pairs = data.get("pairs", []) if isinstance(data, dict) else []
+    except Exception:
+        _DEX_MEM[base] = out
+        return out
+
+    # Keep only exact base-symbol matches with real liquidity.
+    good = []
+    for p in pairs:
+        bt = (p.get("baseToken") or {})
+        if str(bt.get("symbol", "")).upper().strip() != base:
+            continue
+        liq = sf((p.get("liquidity") or {}).get("usd"))
+        if not np.isfinite(liq) or liq <= 0:
+            continue
+        good.append(p)
+
+    if not good:
+        _DEX_MEM[base] = out
+        return out
+
+    # Reference = deepest-liquidity pair (least likely to be a scam clone).
+    good.sort(key=lambda p: sf((p.get("liquidity") or {}).get("usd"), 0), reverse=True)
+    ref = good[0]
+
+    total_liq = sum(sf((p.get("liquidity") or {}).get("usd"), 0) for p in good)
+    vol24 = sum(sf((p.get("volume") or {}).get("h24"), 0) for p in good)
+    vol1 = sum(sf((p.get("volume") or {}).get("h1"), 0) for p in good)
+
+    b24 = sum(int((p.get("txns", {}).get("h24", {}) or {}).get("buys", 0) or 0) for p in good)
+    s24 = sum(int((p.get("txns", {}).get("h24", {}) or {}).get("sells", 0) or 0) for p in good)
+    b1 = sum(int((p.get("txns", {}).get("h1", {}) or {}).get("buys", 0) or 0) for p in good)
+    s1 = sum(int((p.get("txns", {}).get("h1", {}) or {}).get("sells", 0) or 0) for p in good)
+
+    pc = ref.get("priceChange") or {}
+    created = sf(ref.get("pairCreatedAt"))
+    age_days = (now_ms() - created) / 86400000.0 if np.isfinite(created) and created > 0 else np.nan
+
+    out["onchain_ok"] = True
+    out["dex_liquidity_usd"] = total_liq
+    out["dex_vol_h24"] = vol24
+    out["dex_vol_h1"] = vol1
+    out["dex_buy_sell_ratio_h24"] = b24 / (b24 + s24) if (b24 + s24) > 0 else np.nan
+    out["dex_buy_sell_ratio_h1"] = b1 / (b1 + s1) if (b1 + s1) > 0 else np.nan
+    out["dex_price_change_h24"] = sf(pc.get("h24"))
+    out["dex_price_change_h1"] = sf(pc.get("h1"))
+    out["dex_pair_age_days"] = age_days
+    out["dex_pairs"] = len(good)
+    out["dex_chain"] = str(ref.get("chainId") or "")
+
+    if np.isfinite(mcap_usd) and mcap_usd > 0 and total_liq > 0:
+        out["liquidity_mcap_ratio"] = total_liq / mcap_usd
+    if total_liq > 0:
+        out["vol_liq_ratio_h24"] = vol24 / total_liq
+
+    _DEX_MEM[base] = out
+    return out
+
+
+def onchain_assessment(oc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Turn raw on-chain data into an early-signal read + a rug/liquidity-risk read.
+
+    early_onchain 0..100 : rising DEX volume + buy-dominant flow on a young-ish,
+                           adequately-liquid pair = the pre-move on-chain tell.
+    liquidity_risk        : LOW / MEDIUM / HIGH / EXTREME based on liquidity
+                           depth, liquidity/mcap ratio and sell dominance.
+    """
+    notes: List[str] = []
+    if not oc.get("onchain_ok"):
+        return {"early_onchain": np.nan, "liquidity_risk": "UNKNOWN", "onchain_notes": notes}
+
+    liq = sf(oc.get("dex_liquidity_usd"))
+    vol24 = sf(oc.get("dex_vol_h24"))
+    bs24 = sf(oc.get("dex_buy_sell_ratio_h24"))
+    bs1 = sf(oc.get("dex_buy_sell_ratio_h1"))
+    age = sf(oc.get("dex_pair_age_days"))
+    liq_mcap = sf(oc.get("liquidity_mcap_ratio"))
+    vol_liq = sf(oc.get("vol_liq_ratio_h24"))
+
+    # --- Early on-chain signal ---
+    score = 0.0
+    # Buy dominance (recent hour weighted more).
+    if np.isfinite(bs1):
+        score += clamp((bs1 - 0.5) * 120, -20, 30)
+        if bs1 >= 0.62:
+            notes.append(f"DEX buy-dominant 1h {bs1*100:.0f}%")
+    if np.isfinite(bs24):
+        score += clamp((bs24 - 0.5) * 80, -12, 20)
+    # Volume churn vs liquidity: healthy activity, not a ghost pool.
+    if np.isfinite(vol_liq):
+        if vol_liq >= 3:
+            score += 22
+            notes.append(f"high DEX churn {vol_liq:.1f}x liq/24h")
+        elif vol_liq >= 1:
+            score += 14
+        elif vol_liq >= 0.3:
+            score += 6
+    # Youth bonus: young pairs still have discovery ahead (but not seconds-old).
+    if np.isfinite(age):
+        if 1 <= age <= 45:
+            score += 18
+            notes.append(f"young pair ~{age:.0f}d old")
+        elif age < 1:
+            score += 6  # extremely new = risky, small bonus only
+        elif age <= 120:
+            score += 8
+    early = clamp(score, 0, 100)
+
+    # --- Liquidity / rug risk ---
+    risk = "LOW"
+    if not np.isfinite(liq) or liq < 20_000:
+        risk = "EXTREME"
+        notes.append(f"very thin DEX liquidity {'-' if not np.isfinite(liq) else _short_usd(liq)}")
+    elif liq < 80_000:
+        risk = "HIGH"
+        notes.append(f"thin DEX liquidity {_short_usd(liq)}")
+    elif liq < 300_000:
+        risk = "MEDIUM"
+    if np.isfinite(liq_mcap) and liq_mcap < 0.01:
+        # liquidity < 1% of mcap => hard to exit without heavy slippage
+        if risk in ("LOW", "MEDIUM"):
+            risk = "HIGH"
+        notes.append(f"liquidity only {liq_mcap*100:.2f}% of mcap")
+    if np.isfinite(bs1) and bs1 <= 0.38:
+        notes.append(f"DEX sell-dominant 1h {(1-bs1)*100:.0f}%")
+
+    return {"early_onchain": early, "liquidity_risk": risk, "onchain_notes": notes}
+
+
+def _short_usd(x: float) -> str:
+    v = sf(x)
+    if not np.isfinite(v):
+        return "-"
+    if abs(v) >= 1e9:
+        return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6:
+        return f"${v/1e6:.2f}M"
+    if abs(v) >= 1e3:
+        return f"${v/1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+# ---------------------------------------------------------------------------
+# Indicators
+# ---------------------------------------------------------------------------
+
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def rsi(s: pd.Series, period: int = 14) -> pd.Series:
+    d = s.diff()
+    gain = d.clip(lower=0)
+    loss = -d.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50.0)
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    pc = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - pc).abs(),
+            (df["low"] - pc).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy()
+
+    x["ema20"] = ema(x["close"], 20)
+    x["ema50"] = ema(x["close"], 50)
+    x["ema200"] = ema(x["close"], 200)
+
+    x["rsi14"] = rsi(x["close"], 14)
+
+    x["macd"] = ema(x["close"], 12) - ema(x["close"], 26)
+    x["macd_signal"] = ema(x["macd"], 9)
+    x["macd_hist"] = x["macd"] - x["macd_signal"]
+
+    x["atr14"] = atr(x, 14)
+
+    x["vol_ma20"] = x["volume"].rolling(20).mean()
+    x["vol_ratio"] = x["volume"] / x["vol_ma20"].replace(0, np.nan)
+
+    x["turnover_ma20"] = x["turnover"].rolling(20).mean()
+    x["turnover_ratio"] = x["turnover"] / x["turnover_ma20"].replace(0, np.nan)
+
+    x["support20"] = x["low"].rolling(20).min()
+    x["resistance20"] = x["high"].rolling(20).max()
+    x["support50"] = x["low"].rolling(50).min()
+    x["resistance50"] = x["high"].rolling(50).max()
+
+    x["ret1"] = x["close"].pct_change()
+    x["ret6"] = x["close"].pct_change(6)
+
+    # Candle shock metrics
+    spread = (x["high"] - x["low"]).replace(0, np.nan)
+    x["upper_wick_ratio"] = (
+        x["high"] - x[["open", "close"]].max(axis=1)
+    ) / spread
+    x["lower_wick_ratio"] = (
+        x[["open", "close"]].min(axis=1) - x["low"]
+    ) / spread
+
+    return x
+
+
+def snapshot(df: pd.DataFrame) -> Dict[str, float]:
+    x = enrich(df)
+    row = x.iloc[-1]
+    prev = x.iloc[-2]
+
+    close = sf(row["close"])
+    e20 = sf(row["ema20"])
+    e50 = sf(row["ema50"])
+    e200 = sf(row["ema200"])
+
+    trend_score = 0
+    if close > e20:
+        trend_score += 1
+    if e20 > e50:
+        trend_score += 1
+    if e50 > e200:
+        trend_score += 1
+
+    return {
+        "close": close,
+        "ema20": e20,
+        "ema50": e50,
+        "ema200": e200,
+        "rsi": sf(row["rsi14"], 50.0),
+        "macd_hist": sf(row["macd_hist"], 0.0),
+        "macd_hist_prev": sf(prev["macd_hist"], 0.0),
+        "atr": sf(row["atr14"], 0.0),
+        "vol_ratio": sf(row["vol_ratio"], 1.0),
+        "turnover_ratio": sf(row["turnover_ratio"], 1.0),
+        "support20": sf(row["support20"], close),
+        "resistance20": sf(row["resistance20"], close),
+        "support50": sf(row["support50"], close),
+        "resistance50": sf(row["resistance50"], close),
+        "ret1": sf(row["ret1"], 0.0),
+        "ret6": sf(row["ret6"], 0.0),
+        "upper_wick_ratio": sf(row["upper_wick_ratio"], 0.0),
+        "lower_wick_ratio": sf(row["lower_wick_ratio"], 0.0),
+        "trend_score": trend_score,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Early accumulation / pre-breakout detection
+# ---------------------------------------------------------------------------
+# The original scanner rewards coins whose EMAs are ALREADY fully stacked and
+# that are ALREADY near a breakout. That is late. Explosive moves are easiest
+# to catch just before/at the transition from a quiet base into expansion.
+#
+# This detector looks for the classic pre-move footprint:
+#   1. A tight, low-volatility base (range compression) after a downtrend/chop.
+#   2. Volume starting to expand from a dried-up base (accumulation waking up).
+#   3. Price reclaiming a mid-term EMA / holding higher lows (early trend shift).
+#   4. Not yet extended (still close to the base, not up hundreds of % already).
+
+def accumulation_metrics(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Operates on a daily (or 4H) enriched frame. Returns 0..100 'coiled' score
+    plus supporting stats. Higher = tighter base with volume waking up and an
+    early upward shift, i.e. a pre-breakout footprint rather than a finished run.
+    """
+    x = enrich(df).dropna().reset_index(drop=True)
+    empty = {
+        "accumulation_score": np.nan,
+        "range_compression_pct": np.nan,
+        "vol_wakeup_ratio": np.nan,
+        "dist_from_base_pct": np.nan,
+        "higher_lows": np.nan,
+        "phase": "UNKNOWN",
+    }
+    if len(x) < 60:
+        return empty
+
+    close = sf(x["close"].iloc[-1])
+    if not np.isfinite(close) or close <= 0:
+        return empty
+
+    # 1) Range compression: recent 20-bar high/low band width vs the prior
+    #    60-bar band. A shrinking band = coiling.
+    recent = x.tail(20)
+    prior = x.tail(80).head(60)
+    recent_band = (sf(recent["high"].max()) - sf(recent["low"].min()))
+    prior_band = (sf(prior["high"].max()) - sf(prior["low"].min()))
+    recent_band_pct = recent_band / close * 100 if close > 0 else np.nan
+    compression = np.nan
+    if np.isfinite(recent_band) and np.isfinite(prior_band) and prior_band > 0:
+        compression = clamp((1 - recent_band / prior_band) * 100, 0, 100)
+
+    # 2) Volume wake-up: last 5 bars avg volume vs the prior 30 bars. Rising
+    #    volume off a dried-up base is the accumulation tell.
+    v_recent = sf(x["volume"].tail(5).mean())
+    v_base = sf(x["volume"].tail(35).head(30).mean())
+    vol_wakeup = v_recent / v_base if np.isfinite(v_base) and v_base > 0 else np.nan
+
+    # 3) Distance from the base low: how far above the 60-bar low are we? A
+    #    coin still near its base has room; one already up 300% is extended.
+    base_low = sf(x["low"].tail(60).min())
+    dist_from_base = (close / base_low - 1) * 100 if np.isfinite(base_low) and base_low > 0 else np.nan
+
+    # 4) Higher-lows structure over the last ~15 bars (early demand).
+    lows = x["low"].tail(15).reset_index(drop=True)
+    hl = 0
+    for i in range(1, len(lows)):
+        if sf(lows[i]) >= sf(lows[i - 1]) * 0.995:
+            hl += 1
+    higher_lows_ratio = hl / max(1, len(lows) - 1) * 100
+
+    # Early trend shift: reclaiming EMA50 from below.
+    e50 = sf(x["ema50"].iloc[-1])
+    e50_prev = sf(x["ema50"].iloc[-10]) if len(x) >= 10 else e50
+    reclaim = close >= e50 and e50 >= e50_prev
+
+    # Compose the score.
+    score = 0.0
+    if np.isfinite(compression):
+        score += clamp(compression, 0, 100) * 0.30          # up to 30
+    if np.isfinite(vol_wakeup):
+        score += clamp((vol_wakeup - 1) * 40, 0, 30)         # up to 30
+    score += clamp(higher_lows_ratio, 0, 100) * 0.20         # up to 20
+    if reclaim:
+        score += 12
+    # Penalize already-extended names: the further from base, the less "early".
+    if np.isfinite(dist_from_base):
+        if dist_from_base > 150:
+            score -= 25
+        elif dist_from_base > 60:
+            score -= 12
+        elif dist_from_base <= 25:
+            score += 8   # still hugging the base = genuinely early
+
+    score = clamp(score, 0, 100)
+
+    # Phase label.
+    if np.isfinite(dist_from_base) and dist_from_base > 150:
+        phase = "EXTENDED"
+    elif score >= 65:
+        phase = "COILED_EARLY"
+    elif score >= 45:
+        phase = "BASING"
+    elif reclaim and np.isfinite(vol_wakeup) and vol_wakeup >= 1.3:
+        phase = "EARLY_BREAKOUT"
+    else:
+        phase = "NEUTRAL"
+
+    return {
+        "accumulation_score": score,
+        "range_compression_pct": compression,
+        "vol_wakeup_ratio": vol_wakeup,
+        "dist_from_base_pct": dist_from_base,
+        "higher_lows": higher_lows_ratio,
+        "phase": phase,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rule-based chart pattern detection (honest: computed from OHLC, not "reading"
+# a chart image). Detects the classic bullish and bearish structures.
+# ---------------------------------------------------------------------------
+
+def detect_patterns(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Return a list of named patterns with a direction each, plus a net bias.
+    Patterns are derived purely from price/volume math on the enriched frame,
+    so every call is explainable and reproducible.
+    """
+    x = enrich(df).dropna().reset_index(drop=True)
+    patterns: List[Dict[str, str]] = []
+    if len(x) < 60:
+        return {"patterns": patterns, "pattern_bias": 0.0}
+
+    close = sf(x["close"].iloc[-1])
+    e20 = sf(x["ema20"].iloc[-1]); e50 = sf(x["ema50"].iloc[-1]); e200 = sf(x["ema200"].iloc[-1])
+    rsi = sf(x["rsi14"].iloc[-1], 50)
+    atr = sf(x["atr14"].iloc[-1], 0)
+    vr = sf(x["vol_ratio"].iloc[-1], 1)
+
+    hi20 = sf(x["high"].tail(20).max()); lo20 = sf(x["low"].tail(20).min())
+    hi50 = sf(x["high"].tail(50).max()); lo50 = sf(x["low"].tail(50).min())
+
+    def add(name, direction, why):
+        patterns.append({"name": name, "direction": direction, "why": why})
+
+    # --- Trend structure via EMAs ---
+    if close > e20 > e50 > e200:
+        add("Bullish EMA stack", "bull", "price > EMA20 > EMA50 > EMA200")
+    elif close < e20 < e50 < e200:
+        add("Bearish EMA stack", "bear", "price < EMA20 < EMA50 < EMA200")
+
+    # --- Volatility squeeze (compression) ---
+    recent_band = (sf(x["high"].tail(14).max()) - sf(x["low"].tail(14).min()))
+    prior_band = (sf(x["high"].tail(56).head(42).max()) - sf(x["low"].tail(56).head(42).min()))
+    if np.isfinite(recent_band) and np.isfinite(prior_band) and prior_band > 0 and recent_band / prior_band < 0.55:
+        add("Volatility squeeze", "neutral", "range compressing — a big move is loading")
+
+    # --- Breakout / breakdown of 20-bar range ---
+    prev_hi20 = sf(x["high"].iloc[-21:-1].max(), hi20)
+    prev_lo20 = sf(x["low"].iloc[-21:-1].min(), lo20)
+    if close >= prev_hi20 and vr >= 1.2:
+        add("Range breakout", "bull", "closed above 20-bar high on rising volume")
+    elif close <= prev_lo20 and vr >= 1.2:
+        add("Range breakdown", "bear", "broke 20-bar low on rising volume")
+
+    # --- Higher-lows / lower-highs over last 15 ---
+    lows = x["low"].tail(15).reset_index(drop=True)
+    highs = x["high"].tail(15).reset_index(drop=True)
+    hl = sum(1 for i in range(1, len(lows)) if sf(lows[i]) >= sf(lows[i-1]) * 0.997)
+    lh = sum(1 for i in range(1, len(highs)) if sf(highs[i]) <= sf(highs[i-1]) * 1.003)
+    if hl >= (len(lows) - 1) * 0.7:
+        add("Higher lows", "bull", "demand stepping up")
+    if lh >= (len(highs) - 1) * 0.7:
+        add("Lower highs", "bear", "supply capping rallies")
+
+    # --- RSI extremes ---
+    if rsi >= 78:
+        add("Overbought (RSI)", "bear", f"RSI {rsi:.0f} — stretched, reversion risk")
+    elif rsi <= 25:
+        add("Oversold (RSI)", "bull", f"RSI {rsi:.0f} — washed out, bounce risk")
+
+    # --- Simple RSI divergence over last ~20 bars ---
+    try:
+        seg = x.tail(20).reset_index(drop=True)
+        price_hh = sf(seg["close"].iloc[-1]) > sf(seg["close"].iloc[:-1].max()) * 0.999
+        rsi_lower = sf(seg["rsi14"].iloc[-1]) < sf(seg["rsi14"].iloc[:-1].max()) - 3
+        if price_hh and rsi_lower:
+            add("Bearish RSI divergence", "bear", "price higher but RSI weaker")
+        price_ll = sf(seg["close"].iloc[-1]) < sf(seg["close"].iloc[:-1].min()) * 1.001
+        rsi_higher = sf(seg["rsi14"].iloc[-1]) > sf(seg["rsi14"].iloc[:-1].min()) + 3
+        if price_ll and rsi_higher:
+            add("Bullish RSI divergence", "bull", "price lower but RSI stronger")
+    except Exception:
+        pass
+
+    # --- Blow-off / exhaustion wick on the last candle ---
+    last = x.iloc[-1]
+    uw = sf(last["upper_wick_ratio"], 0); lw = sf(last["lower_wick_ratio"], 0)
+    if uw >= 0.55 and vr >= 1.5:
+        add("Upper-wick rejection", "bear", "sellers rejected the highs on volume")
+    if lw >= 0.55 and vr >= 1.5:
+        add("Lower-wick support", "bull", "buyers defended the lows on volume")
+
+    bias = sum({"bull": 1, "bear": -1}.get(p["direction"], 0) for p in patterns)
+    return {"patterns": patterns, "pattern_bias": float(bias)}
+
+
+# ---------------------------------------------------------------------------
+# Directional bias — LONG / SHORT / NEUTRAL with honest shorting warnings
+# ---------------------------------------------------------------------------
+
+def directional_bias(
+    s4h: Dict[str, float],
+    s1d: Dict[str, float],
+    accum: Dict[str, float],
+    patterns: Dict[str, Any],
+    deriv: Dict[str, Any],
+    btc: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Decide whether the cleaner opportunity is LONG, SHORT, or NEUTRAL, combining
+    trend, phase, patterns, derivatives flow and BTC regime. Shorting is flagged
+    as high-risk because it is: losses are unbounded and squeezes are brutal.
+    """
+    score = 0.0
+    reasons: List[str] = []
+
+    ts4 = s4h.get("trend_score", 0)
+    score += (ts4 - 1.5) * 20
+    if s4h.get("macd_hist", 0) > 0:
+        score += 10
+    else:
+        score -= 10
+
+    rsi = s4h.get("rsi", 50)
+    if rsi >= 80:
+        score -= 20; reasons.append("overbought")
+    elif rsi <= 25:
+        score += 15; reasons.append("oversold")
+
+    score += patterns.get("pattern_bias", 0) * 10
+
+    phase = accum.get("phase", "UNKNOWN")
+    if phase == "EXTENDED":
+        score -= 15; reasons.append("extended")
+    elif phase in ("COILED_EARLY", "EARLY_BREAKOUT"):
+        score += 12
+
+    fl = sf(deriv.get("flow_imbalance"))
+    if np.isfinite(fl):
+        score += clamp(fl * 40, -20, 20)
+
+    lab = btc.get("label", "UNKNOWN")
+    score += {"RISK_ON": 12, "MIXED": 0, "RISK_OFF": -15, "UNKNOWN": 0}.get(lab, 0)
+
+    if score >= 25:
+        bias = "LONG"
+    elif score <= -25:
+        bias = "SHORT"
+    else:
+        bias = "NEUTRAL"
+
+    return {
+        "direction": bias,
+        "direction_score": int(round(clamp(score, -100, 100))),
+        "direction_reasons": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Discipline / anti-liquidation guardrails — the most protective layer
+# ---------------------------------------------------------------------------
+
+def discipline_check(
+    s4h: Dict[str, float],
+    accum: Dict[str, float],
+    fund: Dict[str, Any],
+    oc_view: Dict[str, Any],
+    change_24h_pct: float,
+) -> Dict[str, Any]:
+    """
+    Detect the exact conditions that lead to blown accounts — chasing extended
+    moves, overbought entries, thin liquidity, hype-driven pumps — and return
+    hard warnings + a safe-leverage suggestion. This is here because the user's
+    real risk is not missing a moonshot; it is getting liquidated by chasing.
+    """
+    warnings: List[str] = []
+    chase = False
+
+    rsi = s4h.get("rsi", 50)
+    dist = sf(accum.get("dist_from_base_pct"))
+    chg30 = sf(fund.get("chg_30d_pct"))
+    phase = accum.get("phase", "UNKNOWN")
+
+    if rsi >= 78:
+        warnings.append(f"RSI {rsi:.0f}: overbought — poor place to buy")
+        chase = True
+    if np.isfinite(dist) and dist > 80:
+        warnings.append(f"already +{dist:.0f}% off its base — the move is largely done")
+        chase = True
+    if np.isfinite(chg30) and chg30 > 150:
+        warnings.append(f"+{chg30:.0f}% in 30d — buying late in the cycle")
+        chase = True
+    if change_24h_pct > 25:
+        warnings.append(f"+{change_24h_pct:.0f}% today — chasing a vertical candle")
+        chase = True
+    if phase == "EXTENDED":
+        warnings.append("phase EXTENDED — this is a chase, not an entry")
+        chase = True
+    if oc_view.get("liquidity_risk") in ("HIGH", "EXTREME"):
+        warnings.append("thin liquidity — hard to exit, slippage/rug risk")
+
+    # Safe leverage suggestion: the hotter/thinner it is, the closer to spot-only.
+    if chase or oc_view.get("liquidity_risk") in ("HIGH", "EXTREME"):
+        max_lev = 1
+        lev_note = "SPOT ONLY (no leverage). This is exactly the setup that liquidates accounts."
+    elif rsi >= 68 or (np.isfinite(dist) and dist > 40):
+        max_lev = 2
+        lev_note = "Max 2x if any. Getting extended."
+    elif phase in ("COILED_EARLY", "EARLY_BREAKOUT", "BASING"):
+        max_lev = 3
+        lev_note = "Max 3x. Still respect the stop."
+    else:
+        max_lev = 2
+        lev_note = "Keep leverage low (<=2x)."
+
+    if chase:
+        stance = "DO NOT CHASE"
+    elif warnings:
+        stance = "CAUTION"
+    else:
+        stance = "OK to plan"
+
+    return {
+        "discipline_stance": stance,
+        "is_chase": chase,
+        "discipline_warnings": warnings,
+        "max_leverage_suggested": max_lev,
+        "leverage_note": lev_note,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OI state persistence
+# ---------------------------------------------------------------------------
+
+def load_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "symbols": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("state must be object")
+        data.setdefault("symbols", {})
+        return data
+    except Exception:
+        return {"version": 1, "symbols": {}}
+
+
+def save_state(path: Path, state: Dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def update_oi_state(
+    state: Dict[str, Any],
+    symbol: str,
+    current_oi: float,
+    mark_price: float,
+) -> Dict[str, float]:
+    sym = symbol_clean(symbol)
+    bucket = state.setdefault("symbols", {}).setdefault(sym, [])
+
+    ts = now_ms()
+
+    # Keep valid records only.
+    clean = []
+    for row in bucket:
+        try:
+            t = int(row["ts"])
+            oi = float(row["oi"])
+            px = float(row.get("mark_price", 0))
+            if ts - t <= 7 * 24 * 3600 * 1000:
+                clean.append({"ts": t, "oi": oi, "mark_price": px})
+        except Exception:
+            pass
+
+    # Compare against the most recent previous snapshot at least 20 min old.
+    baseline = None
+    for row in sorted(clean, key=lambda z: z["ts"], reverse=True):
+        age_min = (ts - row["ts"]) / 60000.0
+        if age_min >= 20:
+            baseline = row
+            break
+
+    oi_delta_pct = np.nan
+    baseline_age_min = np.nan
+
+    if baseline and baseline["oi"] > 0:
+        oi_delta_pct = (current_oi / baseline["oi"] - 1.0) * 100.0
+        baseline_age_min = (ts - baseline["ts"]) / 60000.0
+
+    clean.append({
+        "ts": ts,
+        "oi": current_oi,
+        "mark_price": mark_price,
+    })
+
+    # Keep max 200 local points per symbol.
+    state["symbols"][sym] = clean[-200:]
+
+    return {
+        "oi_delta_pct": oi_delta_pct,
+        "oi_baseline_age_min": baseline_age_min,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Microstructure
+# ---------------------------------------------------------------------------
+
+def orderbook_metrics(book: Dict[str, Any], depth_levels: int = 50) -> Dict[str, float]:
+    bids = book.get("b", [])[:depth_levels]
+    asks = book.get("a", [])[:depth_levels]
+
+    if not bids or not asks:
+        return {
+            "book_imbalance": np.nan,
+            "bid_share": np.nan,
+            "spread_bps": np.nan,
+        }
+
+    best_bid = sf(bids[0][0])
+    best_ask = sf(asks[0][0])
+    mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else np.nan
+
+    def weighted_notional(levels: Iterable[List[Any]], side: str) -> float:
+        total = 0.0
+        for row in levels:
+            if len(row) < 2:
+                continue
+            p = sf(row[0], 0.0)
+            q = sf(row[1], 0.0)
+            if p <= 0 or q <= 0 or not np.isfinite(mid) or mid <= 0:
+                continue
+
+            distance = abs(p / mid - 1.0)
+            # Near-mid liquidity matters more than very distant walls.
+            weight = math.exp(-distance / 0.004)
+            total += p * q * weight
+        return total
+
+    bid_n = weighted_notional(bids, "bid")
+    ask_n = weighted_notional(asks, "ask")
+    total = bid_n + ask_n
+
+    imbalance = (bid_n - ask_n) / total if total > 0 else np.nan
+    bid_share = bid_n / total if total > 0 else np.nan
+    spread_bps = ((best_ask - best_bid) / mid) * 10000 if mid > 0 else np.nan
+
+    return {
+        "book_imbalance": imbalance,
+        "bid_share": bid_share,
+        "spread_bps": spread_bps,
+    }
+
+
+def fill_flow_metrics(fills: List[Dict[str, Any]]) -> Dict[str, float]:
+    buy_quote = 0.0
+    sell_quote = 0.0
+    buy_count = 0
+    sell_count = 0
+
+    for f in fills:
+        p = sf(f.get("price"), 0.0)
+        q = sf(f.get("size"), 0.0)
+        notional = p * q
+        side = str(f.get("side", "")).lower()
+
+        if side == "buy":
+            buy_quote += notional
+            buy_count += 1
+        elif side == "sell":
+            sell_quote += notional
+            sell_count += 1
+
+    total = buy_quote + sell_quote
+    buy_ratio = buy_quote / total if total > 0 else np.nan
+    flow_imbalance = (
+        (buy_quote - sell_quote) / total if total > 0 else np.nan
+    )
+
+    return {
+        "buy_ratio": buy_ratio,
+        "flow_imbalance": flow_imbalance,
+        "buy_quote": buy_quote,
+        "sell_quote": sell_quote,
+        "fill_count": buy_count + sell_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Futures derivatives
+# ---------------------------------------------------------------------------
+
+def funding_metrics(
+    current_rate: float,
+    history: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    vals = []
+    for row in history:
+        v = sf(row.get("fundingRate"))
+        if np.isfinite(v):
+            vals.append(v)
+
+    mean = float(np.mean(vals)) if vals else np.nan
+    std = float(np.std(vals, ddof=0)) if len(vals) >= 3 else np.nan
+
+    z = np.nan
+    if np.isfinite(std) and std > 1e-12:
+        z = (current_rate - mean) / std
+
+    return {
+        "funding_rate": current_rate,
+        "funding_mean": mean,
+        "funding_z": z,
+    }
+
+
+def fetch_derivatives_bundle(
+    symbol: str,
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Returns futures metrics if the USDT perpetual exists.
+    Gracefully degrades for spot-only symbols.
+    """
+    out = {
+        "has_futures": False,
+        "open_interest": np.nan,
+        "oi_usdt": np.nan,
+        "oi_delta_pct": np.nan,
+        "oi_baseline_age_min": np.nan,
+        "funding_rate": np.nan,
+        "funding_mean": np.nan,
+        "funding_z": np.nan,
+        "book_imbalance": np.nan,
+        "bid_share": np.nan,
+        "spread_bps": np.nan,
+        "buy_ratio": np.nan,
+        "flow_imbalance": np.nan,
+        "fill_count": 0,
+    }
+
+    try:
+        ticker = fetch_ticker(symbol, "USDT-FUTURES")
+        current_oi = sf(ticker.get("openInterest"))
+        funding = sf(ticker.get("fundingRate"))
+        mark_price = sf(ticker.get("markPrice"), sf(ticker.get("lastPrice")))
+
+        out["has_futures"] = True
+        out["open_interest"] = current_oi
+        out["oi_usdt"] = (
+            current_oi * mark_price
+            if np.isfinite(current_oi) and np.isfinite(mark_price)
+            else np.nan
+        )
+
+        if np.isfinite(current_oi) and current_oi > 0:
+            out.update(
+                update_oi_state(state, symbol, current_oi, mark_price)
+            )
+
+        try:
+            hist = fetch_funding_history(symbol, 30)
+            out.update(funding_metrics(funding, hist))
+        except Exception:
+            out["funding_rate"] = funding
+
+        try:
+            book = fetch_orderbook(symbol, "USDT-FUTURES", 50)
+            out.update(orderbook_metrics(book, 50))
+        except Exception:
+            pass
+
+        try:
+            fills = fetch_recent_fills(symbol, "USDT-FUTURES", 100)
+            out.update(fill_flow_metrics(fills))
+        except Exception:
+            pass
+
+    except Exception:
+        # Spot-only / no active futures market.
+        return out
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# BTC regime
+# ---------------------------------------------------------------------------
+
+def btc_regime() -> Dict[str, Any]:
+    try:
+        df = fetch_candles("BTCUSDT", "4H", 360, "SPOT")
+        s = snapshot(df)
+        score = 0
+
+        if s["close"] > s["ema20"]:
+            score += 1
+        if s["ema20"] > s["ema50"]:
+            score += 1
+        if s["rsi"] >= 50:
+            score += 1
+        if s["macd_hist"] > 0:
+            score += 1
+
+        if score >= 3:
+            label = "RISK_ON"
+        elif score == 2:
+            label = "MIXED"
+        else:
+            label = "RISK_OFF"
+
+        return {
+            "score": score,
+            "label": label,
+            "rsi": s["rsi"],
+            "close": s["close"],
+        }
+    except Exception:
+        return {
+            "score": 2,
+            "label": "UNKNOWN",
+            "rsi": 50.0,
+            "close": np.nan,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Liquidation pressure proxy
+# ---------------------------------------------------------------------------
+
+def liquidation_proxy(
+    s1h: Dict[str, float],
+    s4h: Dict[str, float],
+    d: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Proxy — NOT actual exchange liquidation totals.
+
+    LONG_FLUSH:
+      sharp downside + sell-heavy taker flow + OI contraction + volume shock.
+
+    SHORT_SQUEEZE:
+      sharp upside + buy-heavy taker flow + OI contraction + volume shock.
+
+    BUILDING_LONGS / BUILDING_SHORTS:
+      price move accompanied by rising OI when local OI history is available.
+    """
+    price_move_pct = s1h["ret1"] * 100.0
+    oi_delta = d.get("oi_delta_pct", np.nan)
+    flow = d.get("flow_imbalance", np.nan)
+    vr = max(s1h.get("vol_ratio", 1.0), s4h.get("vol_ratio", 1.0))
+
+    label = "NORMAL"
+    strength = 0.0
+
+    oi_known = np.isfinite(oi_delta)
+    flow_known = np.isfinite(flow)
+
+    if price_move_pct <= -1.0 and flow_known and flow <= -0.20:
+        strength += min(35, abs(price_move_pct) * 10)
+        strength += min(25, abs(flow) * 60)
+        if vr >= 1.5:
+            strength += 15
+        if oi_known and oi_delta <= -0.5:
+            strength += min(25, abs(oi_delta) * 5)
+            label = "LONG_FLUSH"
+        else:
+            label = "SELL_PRESSURE"
+
+    elif price_move_pct >= 1.0 and flow_known and flow >= 0.20:
+        strength += min(35, abs(price_move_pct) * 10)
+        strength += min(25, abs(flow) * 60)
+        if vr >= 1.5:
+            strength += 15
+        if oi_known and oi_delta <= -0.5:
+            strength += min(25, abs(oi_delta) * 5)
+            label = "SHORT_SQUEEZE"
+        else:
+            label = "BUY_PRESSURE"
+
+    elif oi_known:
+        if price_move_pct > 0.5 and oi_delta > 0.5:
+            label = "BUILDING_LONGS"
+            strength = min(100, 20 + price_move_pct * 8 + oi_delta * 5)
+        elif price_move_pct < -0.5 and oi_delta > 0.5:
+            label = "BUILDING_SHORTS"
+            strength = min(100, 20 + abs(price_move_pct) * 8 + oi_delta * 5)
+
+    return {
+        "liq_proxy": label,
+        "liq_proxy_strength": clamp(strength, 0, 100),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Historical backtest
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BacktestResult:
+    trades: int
+    wins: int
+    losses: int
+    win_rate: float
+    avg_r: float
+    profit_factor: float
+    max_drawdown_r: float
+    expectancy_r: float
+
+
+def backtest_core(
+    raw_df: pd.DataFrame,
+    min_bars: int = 260,
+    hold_bars: int = 18,
+    round_trip_cost_pct: float = 0.30,
+) -> BacktestResult:
+    """
+    Conservative long-only test of the technical/volume core setup.
+
+    Signal uses only values available at the close of candle i.
+    Entry uses the NEXT candle's open to reduce look-ahead bias.
+    If TP and SL are both touched in the same candle, SL is assumed first.
+
+    `round_trip_cost_pct` models real trading friction (taker fees + slippage)
+    as a % of position value on a round trip, e.g. 0.30% ~= 0.1% fee each side
+    plus slippage. It is converted per-trade into R (fraction of the stop
+    distance) and subtracted from every outcome so the numbers are not
+    fantasy fee-free results.
+    """
+    x = enrich(raw_df).dropna().reset_index(drop=True)
+
+    if len(x) < min_bars:
+        return BacktestResult(0, 0, 0, np.nan, np.nan, np.nan, np.nan, np.nan)
+
+    results_r: List[float] = []
+    i = 205
+
+    while i < len(x) - hold_bars - 2:
+        row = x.iloc[i]
+
+        close = sf(row["close"])
+        atrv = sf(row["atr14"])
+        e20 = sf(row["ema20"])
+        e50 = sf(row["ema50"])
+        e200 = sf(row["ema200"])
+        r = sf(row["rsi14"], 50)
+        mh = sf(row["macd_hist"], 0)
+        vr = sf(row["vol_ratio"], 1)
+
+        if not all(np.isfinite(v) for v in [close, atrv, e20, e50, e200]):
+            i += 1
+            continue
+
+        trend_ok = close > e20 > e50 > e200
+        momentum_ok = 50 <= r <= 72 and mh > 0
+        volume_ok = vr >= 1.05
+
+        prev_res = sf(x["high"].iloc[max(0, i - 20):i].max(), close)
+        breakout_proximity = close >= prev_res * 0.985
+
+        signal = trend_ok and momentum_ok and volume_ok and breakout_proximity
+
+        if not signal:
+            i += 1
+            continue
+
+        entry = sf(x.iloc[i + 1]["open"])
+        if not np.isfinite(entry) or entry <= 0:
+            i += 1
+            continue
+
+        stop_dist = max(1.5 * atrv, entry * 0.012)
+        stop_dist = min(stop_dist, entry * 0.10)
+        stop = entry - stop_dist
+        tp = entry + 2.0 * stop_dist
+
+        outcome_r = None
+        exit_index = i + hold_bars
+
+        for j in range(i + 1, min(len(x), i + 1 + hold_bars)):
+            lo = sf(x.iloc[j]["low"])
+            hi = sf(x.iloc[j]["high"])
+
+            hit_sl = lo <= stop
+            hit_tp = hi >= tp
+
+            if hit_sl and hit_tp:
+                # Conservative same-candle assumption.
+                outcome_r = -1.0
+                exit_index = j
+                break
+            elif hit_sl:
+                outcome_r = -1.0
+                exit_index = j
+                break
+            elif hit_tp:
+                outcome_r = 2.0
+                exit_index = j
+                break
+
+        if outcome_r is None:
+            last_close = sf(x.iloc[min(exit_index, len(x) - 1)]["close"])
+            outcome_r = clamp((last_close - entry) / stop_dist, -1.0, 2.0)
+
+        # Subtract realistic trading friction (fees + slippage), expressed in R.
+        cost_r = (round_trip_cost_pct / 100.0 * entry) / stop_dist if stop_dist > 0 else 0.0
+        outcome_r = float(outcome_r) - cost_r
+
+        results_r.append(float(outcome_r))
+
+        # Avoid immediate overlapping entries while the previous test trade is active.
+        i = max(i + 1, exit_index)
+
+    if not results_r:
+        return BacktestResult(0, 0, 0, np.nan, np.nan, np.nan, np.nan, np.nan)
+
+    arr = np.array(results_r, dtype=float)
+    wins = int((arr > 0).sum())
+    losses = int((arr <= 0).sum())
+    win_rate = wins / len(arr) * 100.0
+    avg_r = float(arr.mean())
+
+    gross_profit = float(arr[arr > 0].sum()) if (arr > 0).any() else 0.0
+    gross_loss = float(abs(arr[arr < 0].sum())) if (arr < 0).any() else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+
+    equity = np.cumsum(arr)
+    peaks = np.maximum.accumulate(equity)
+    drawdown = equity - peaks
+    max_dd = float(abs(drawdown.min())) if len(drawdown) else 0.0
+
+    return BacktestResult(
+        trades=len(arr),
+        wins=wins,
+        losses=losses,
+        win_rate=win_rate,
+        avg_r=avg_r,
+        profit_factor=profit_factor,
+        max_drawdown_r=max_dd,
+        expectancy_r=avg_r,
+    )
+
+
+# A backtest needs enough trades before its win-rate/PF/expectancy mean anything.
+# Below this, treat the result as "insufficient sample" rather than as edge.
+MIN_RELIABLE_TRADES = 12
+
+
+def backtest_reliability(bt: BacktestResult) -> str:
+    """Human-readable trust level for the backtest, driven by sample size."""
+    if bt.trades == 0:
+        return "NONE"
+    if bt.trades < MIN_RELIABLE_TRADES:
+        return "INSUFFICIENT"
+    if bt.trades < 25:
+        return "LOW"
+    if bt.trades < 60:
+        return "MODERATE"
+    return "GOOD"
+
+
+def backtest_quality_score(bt: BacktestResult) -> float:
+    """
+    Returns 0..10.
+
+    Small samples are NOT allowed to look like edge: below MIN_RELIABLE_TRADES
+    the score is pinned near neutral regardless of how pretty the win-rate or
+    profit factor looks (a 3-trade "PF 2.8" is noise, not a strategy).
+    """
+    if bt.trades == 0 or not np.isfinite(bt.expectancy_r):
+        return 3.0
+
+    # Insufficient sample => neutral-ish, cannot be rewarded or heavily punished.
+    if bt.trades < MIN_RELIABLE_TRADES:
+        # Nudge only slightly by sign of expectancy so it is not purely flat.
+        base = 3.0
+        if bt.expectancy_r > 0.15:
+            base = 3.6
+        elif bt.expectancy_r < -0.15:
+            base = 2.4
+        return clamp(base, 0, 10)
+
+    sample_factor = clamp(bt.trades / 30.0, 0.5, 1.0)
+
+    expectancy_component = clamp((bt.expectancy_r + 0.15) / 0.65, 0, 1) * 5
+    pf = bt.profit_factor
+    if not np.isfinite(pf):
+        pf_component = 2.0
+    else:
+        pf_component = clamp((pf - 0.8) / 1.2, 0, 1) * 3
+
+    wr_component = clamp((bt.win_rate - 35) / 25, 0, 1) * 2
+
+    raw = expectancy_component + pf_component + wr_component
+    return clamp(raw * sample_factor + 2.0 * (1 - sample_factor), 0, 10)
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def score_setup(
+    s1h: Dict[str, float],
+    s4h: Dict[str, float],
+    s1d: Dict[str, float],
+    deriv: Dict[str, Any],
+    btc: Dict[str, Any],
+    bt: BacktestResult,
+    spot_ticker: Dict[str, Any],
+    accum: Optional[Dict[str, float]] = None,
+) -> Tuple[int, List[str], Dict[str, float]]:
+    accum = accum or {}
+    score = 0.0
+    reasons: List[str] = []
+    breakdown: Dict[str, float] = {}
+
+    # 1) Trend — 20
+    trend_raw = (
+        s1h["trend_score"] * 1.5 +
+        s4h["trend_score"] * 3.0 +
+        s1d["trend_score"] * 2.15
+    )
+    trend_pts = clamp(trend_raw, 0, 20)
+    score += trend_pts
+    breakdown["trend"] = trend_pts
+
+    if s4h["trend_score"] == 3:
+        reasons.append("4H trend aligned")
+    elif s4h["trend_score"] <= 1:
+        reasons.append("4H trend weak")
+
+    # 1b) Earliness / accumulation bonus — up to +10, penalty if extended.
+    # This is what pulls scoring away from "only reward finished uptrends".
+    acc_score = sf(accum.get("accumulation_score"))
+    phase = accum.get("phase", "UNKNOWN")
+    accum_pts = 0.0
+    if np.isfinite(acc_score):
+        accum_pts = clamp(acc_score / 100.0 * 10.0, 0, 10)
+        if phase in ("COILED_EARLY", "EARLY_BREAKOUT"):
+            reasons.append(f"{phase.lower()} (pre-move footprint)")
+        elif phase == "EXTENDED":
+            accum_pts -= 6
+            reasons.append("extended: much of the move may be done")
+    score += accum_pts
+    breakdown["accumulation"] = accum_pts
+
+    # 2) Momentum — 12
+    momentum = 0.0
+    if 52 <= s4h["rsi"] <= 68:
+        momentum += 5
+        reasons.append(f"RSI4H healthy {s4h['rsi']:.1f}")
+    elif 48 <= s4h["rsi"] < 52:
+        momentum += 2.5
+    elif s4h["rsi"] >= 76:
+        momentum -= 3
+        reasons.append(f"RSI4H overheated {s4h['rsi']:.1f}")
+
+    if s4h["macd_hist"] > 0:
+        momentum += 4
+        if s4h["macd_hist"] > s4h["macd_hist_prev"]:
+            momentum += 2
+            reasons.append("MACD4H positive & strengthening")
+
+    if s1h["macd_hist"] > 0:
+        momentum += 1
+
+    momentum = clamp(momentum, 0, 12)
+    score += momentum
+    breakdown["momentum"] = momentum
+
+    # 3) Volume / turnover acceleration — 12
+    vr = max(s1h["vol_ratio"], s4h["vol_ratio"])
+    tr = max(s1h["turnover_ratio"], s4h["turnover_ratio"])
+
+    volume_pts = 0.0
+    if vr >= 2.5:
+        volume_pts += 7
+    elif vr >= 1.7:
+        volume_pts += 5.5
+    elif vr >= 1.2:
+        volume_pts += 4
+    elif vr >= 0.9:
+        volume_pts += 2
+
+    if tr >= 2.0:
+        volume_pts += 5
+    elif tr >= 1.3:
+        volume_pts += 3
+    elif tr >= 0.9:
+        volume_pts += 1.5
+
+    volume_pts = clamp(volume_pts, 0, 12)
+    score += volume_pts
+    breakdown["volume"] = volume_pts
+
+    if vr >= 1.7:
+        reasons.append(f"relative volume expansion {vr:.2f}x")
+
+    # 4) Structure — 10
+    close = s4h["close"]
+    res = s4h["resistance20"]
+    dist_res = ((res - close) / close) if close > 0 else np.nan
+
+    structure = 0.0
+    if np.isfinite(dist_res) and -0.01 <= dist_res <= 0.015 and vr >= 1.2:
+        structure = 9.0
+        reasons.append("near 20-bar breakout with volume")
+    elif close >= s4h["ema20"] and close >= s4h["support20"]:
+        structure = 6.0
+    else:
+        structure = 2.0
+
+    # Avoid rewarding already vertical 24h pumps.
+    chg24 = sf(spot_ticker.get("price24hPcnt"), 0.0) * 100
+    if chg24 > 35:
+        structure -= 4
+        reasons.append(f"24h move overextended +{chg24:.1f}%")
+    elif chg24 > 20:
+        structure -= 2
+        reasons.append(f"24h move hot +{chg24:.1f}%")
+
+    structure = clamp(structure, 0, 10)
+    score += structure
+    breakdown["structure"] = structure
+
+    # 5) Order-book imbalance — 10
+    ob = sf(deriv.get("book_imbalance"))
+    spread = sf(deriv.get("spread_bps"))
+    order_pts = 5.0  # neutral if unavailable
+
+    if np.isfinite(ob):
+        if ob >= 0.30:
+            order_pts = 10
+            reasons.append(f"futures bid-book dominant {ob:+.2f}")
+        elif ob >= 0.15:
+            order_pts = 8
+        elif ob >= 0.03:
+            order_pts = 6
+        elif ob <= -0.30:
+            order_pts = 1
+            reasons.append(f"futures ask-book dominant {ob:+.2f}")
+        elif ob <= -0.15:
+            order_pts = 3
+        else:
+            order_pts = 5
+
+    if np.isfinite(spread) and spread > 20:
+        order_pts -= 2
+        reasons.append(f"wide futures spread {spread:.1f}bps")
+
+    order_pts = clamp(order_pts, 0, 10)
+    score += order_pts
+    breakdown["orderbook"] = order_pts
+
+    # 6) Taker flow — 8
+    flow = sf(deriv.get("flow_imbalance"))
+    flow_pts = 4.0
+    if np.isfinite(flow):
+        if flow >= 0.35:
+            flow_pts = 8
+            reasons.append(f"aggressive buy-flow {flow:+.2f}")
+        elif flow >= 0.15:
+            flow_pts = 6.5
+        elif flow <= -0.35:
+            flow_pts = 0.5
+            reasons.append(f"aggressive sell-flow {flow:+.2f}")
+        elif flow <= -0.15:
+            flow_pts = 2
+    score += flow_pts
+    breakdown["taker_flow"] = flow_pts
+
+    # 7) Derivatives crowding / OI — 13
+    derivatives_pts = 6.5  # neutral fallback
+
+    if deriv.get("has_futures"):
+        derivatives_pts = 7.0
+
+        funding = sf(deriv.get("funding_rate"))
+        fz = sf(deriv.get("funding_z"))
+        oi_delta = sf(deriv.get("oi_delta_pct"))
+
+        # Funding: slightly negative/neutral is healthier for upside than crowded longs.
+        if np.isfinite(funding):
+            if -0.0005 <= funding <= 0.0003:
+                derivatives_pts += 2
+            elif funding > 0.0010:
+                derivatives_pts -= 3
+                reasons.append(f"funding crowded-long {funding:.4%}")
+            elif funding < -0.0010 and s4h["trend_score"] >= 2:
+                derivatives_pts += 2
+                reasons.append(f"negative funding + positive trend {funding:.4%}")
+
+        if np.isfinite(fz):
+            if fz > 2.5:
+                derivatives_pts -= 1.5
+            elif fz < -2.0 and s4h["trend_score"] >= 2:
+                derivatives_pts += 1.0
+
+        # OI expansion + price trend can support a move, but excessive OI growth can crowd.
+        if np.isfinite(oi_delta):
+            if 0.5 <= oi_delta <= 6.0 and s1h["ret1"] > 0:
+                derivatives_pts += 2.5
+                reasons.append(f"OI expanding {oi_delta:+.2f}%")
+            elif oi_delta > 12:
+                derivatives_pts -= 2
+                reasons.append(f"OI expansion extreme {oi_delta:+.2f}%")
+            elif oi_delta < -2 and s1h["ret1"] > 0:
+                derivatives_pts += 1.0
+                reasons.append(f"OI falling into upside move {oi_delta:+.2f}%")
+
+    derivatives_pts = clamp(derivatives_pts, 0, 13)
+    score += derivatives_pts
+    breakdown["derivatives"] = derivatives_pts
+
+    # 8) BTC regime — 5
+    btc_pts = clamp(btc.get("score", 2) / 4 * 5, 0, 5)
+    score += btc_pts
+    breakdown["btc_regime"] = btc_pts
+    reasons.append(f"BTC regime {btc.get('label', 'UNKNOWN')}")
+
+    # 9) Backtest quality — 10
+    bt_pts = backtest_quality_score(bt)
+    score += bt_pts
+    breakdown["backtest"] = bt_pts
+    if bt.trades >= 8:
+        reasons.append(
+            f"BT {bt.trades} trades WR {bt.win_rate:.1f}% E {bt.expectancy_r:+.2f}R"
+        )
+    else:
+        reasons.append(f"BT sample small ({bt.trades} trades)")
+
+    # Risk penalties (can pull the 100-point score down).
+    penalty = 0.0
+
+    if s4h["rsi"] > 82:
+        penalty += 7
+    if chg24 > 50:
+        penalty += 6
+    if vr > 8:
+        penalty += 4
+        reasons.append("volume climax risk")
+    if btc.get("label") == "RISK_OFF":
+        penalty += 3
+
+    score -= penalty
+    breakdown["risk_penalty"] = penalty
+
+    return int(round(clamp(score, 0, 100))), reasons, breakdown
+
+
+def signal_label(score: int, s4h: Dict[str, float]) -> str:
+    if s4h["rsi"] >= 82:
+        return "OVERHEATED"
+    if score >= 82:
+        return "MOONSHOT A"
+    if score >= 72:
+        return "MOONSHOT B"
+    if score >= 62:
+        return "WATCH"
+    if score >= 50:
+        return "NEUTRAL"
+    return "WAIT"
+
+
+# ---------------------------------------------------------------------------
+# Moonshot asymmetry score (separate from trade-quality score)
+# ---------------------------------------------------------------------------
+# The 0-100 trade-quality score answers "is this a clean setup right now?".
+# The asymmetry score answers a DIFFERENT question: "if this works, how big
+# could it get, and am I early enough to catch it?". A coin can be a clean
+# setup (high quality) but a poor moonshot (large cap, no room). We keep them
+# separate so you are not misled by a tidy chart on a coin that can only 2x.
+
+def asymmetry_score(
+    accum: Dict[str, float],
+    fund: Dict[str, Any],
+    fund_view: Dict[str, Any],
+    s4h: Dict[str, float],
+    spot_ticker: Dict[str, Any],
+    oc: Optional[Dict[str, Any]] = None,
+    oc_view: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, List[str]]:
+    oc = oc or {}
+    oc_view = oc_view or {}
+    reasons: List[str] = []
+    score = 0.0
+
+    # 1) Upside room from market cap — 40 pts. This is the single biggest
+    #    driver of whether a 10x-100x is even physically possible.
+    cap_tier = fund_view.get("cap_tier", "UNKNOWN")
+    cap_pts = {
+        "NANO": 40,
+        "MICRO": 34,
+        "SMALL": 24,
+        "MID": 12,
+        "LARGE": 4,
+        "UNKNOWN": 16,  # unknown cap: neutral-ish, cannot confirm room
+    }.get(cap_tier, 16)
+    score += cap_pts
+    reasons.append(f"cap tier {cap_tier}")
+
+    # 2) Earliness — 30 pts. Coiled base / early breakout beats extended.
+    phase = accum.get("phase", "UNKNOWN")
+    acc = sf(accum.get("accumulation_score"))
+    phase_pts = {
+        "COILED_EARLY": 30,
+        "EARLY_BREAKOUT": 26,
+        "BASING": 20,
+        "NEUTRAL": 10,
+        "EXTENDED": 2,
+        "UNKNOWN": 8,
+    }.get(phase, 8)
+    score += phase_pts
+    reasons.append(f"phase {phase}")
+
+    # 3) Not-yet-run check — 15 pts. If it already did a big multiple recently,
+    #    the asymmetric part may be gone.
+    chg7 = sf(fund.get("chg_7d_pct"))
+    chg30 = sf(fund.get("chg_30d_pct"))
+    dist_base = sf(accum.get("dist_from_base_pct"))
+    early_pts = 15.0
+    if np.isfinite(chg30) and chg30 > 300:
+        early_pts -= 12
+        reasons.append(f"already +{chg30:.0f}% in 30d")
+    elif np.isfinite(chg30) and chg30 > 120:
+        early_pts -= 7
+    if np.isfinite(dist_base) and dist_base > 150:
+        early_pts -= 6
+    score += clamp(early_pts, 0, 15)
+
+    # 4) Supply health — 15 pts. Heavy unlock overhang caps sustained upside.
+    fdv_ratio = sf(fund.get("fdv_mcap_ratio"))
+    circ_pct = sf(fund.get("circulating_pct"))
+    supply_pts = 10.0
+    if np.isfinite(fdv_ratio):
+        if fdv_ratio <= 1.5:
+            supply_pts += 5
+        elif fdv_ratio >= 10:
+            supply_pts -= 8
+            reasons.append(f"unlock overhang {fdv_ratio:.1f}x FDV/mcap")
+        elif fdv_ratio >= 3:
+            supply_pts -= 3
+    if np.isfinite(circ_pct) and circ_pct < 20:
+        supply_pts -= 3
+    score += clamp(supply_pts, 0, 15)
+
+    # 5) On-chain early signal — up to +12 bonus. DEX activity often front-runs
+    #    the CEX move, so buy-dominant flow + volume on a young pool is a real
+    #    early tell that the technical/fundamental snapshot cannot see yet.
+    early_oc = sf(oc_view.get("early_onchain"))
+    if np.isfinite(early_oc):
+        oc_bonus = clamp(early_oc / 100.0 * 12.0, 0, 12)
+        score += oc_bonus
+        if early_oc >= 65:
+            reasons.append("on-chain waking up (DEX buy-flow + volume)")
+        for n in (oc_view.get("onchain_notes") or [])[:2]:
+            reasons.append(n)
+
+    # Liquidity / rug risk PENALTY. A moonshot you cannot exit is a trap; thin
+    # or dumping on-chain liquidity slashes the real asymmetry.
+    liq_risk = oc_view.get("liquidity_risk", "UNKNOWN")
+    if liq_risk == "EXTREME":
+        score -= 22
+        reasons.append("EXTREME liquidity risk (can't exit / rug-prone)")
+    elif liq_risk == "HIGH":
+        score -= 12
+        reasons.append("high liquidity risk")
+    elif liq_risk == "MEDIUM":
+        score -= 4
+
+    # Hard ceiling by cap tier: asymmetry is about HOW BIG a move is possible.
+    # A large/mega cap simply cannot 10x-100x no matter how clean the chart is,
+    # so its asymmetry must stay low even if every other factor is perfect.
+    ceiling = {
+        "NANO": 100,
+        "MICRO": 92,
+        "SMALL": 78,
+        "MID": 55,
+        "LARGE": 35,
+        "UNKNOWN": 70,   # cannot confirm cap; leave room but not top-tier
+    }.get(cap_tier, 70)
+    # EXTREME liquidity risk also caps the ceiling hard — no matter the room,
+    # you should not treat an un-exitable token as a prime moonshot.
+    if liq_risk == "EXTREME":
+        ceiling = min(ceiling, 45)
+
+    final = min(clamp(score, 0, 100), ceiling)
+
+    return int(round(final)), reasons
+
+
+def moonshot_tier(asym: int, quality: int, phase: str) -> str:
+    """
+    Combine asymmetry (room + earliness) with trade-quality (clean setup now).
+    A great moonshot candidate has BOTH high asymmetry and a workable setup.
+    """
+    if phase == "EXTENDED":
+        return "CHASING (late)"
+    if asym >= 75 and quality >= 60:
+        return "PRIME MOONSHOT"
+    if asym >= 65 and quality >= 50:
+        return "STRONG WATCH"
+    if asym >= 55:
+        return "SPECULATIVE"
+    if asym >= 40:
+        return "LOW ASYMMETRY"
+    return "AVOID (no room)"
+
+
+def confluence_verdict(
+    quality: int,
+    asym: int,
+    s4h: Dict[str, float],
+    deriv: Dict[str, Any],
+    accum: Dict[str, float],
+    fund_view: Dict[str, Any],
+    oc: Dict[str, Any],
+    oc_view: Dict[str, Any],
+    bt: "BacktestResult",
+    btc: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Fuse every layer into ONE explainable read:
+      - factor scores (each -100..100, positive = supportive of upside),
+      - a 0..100 confluence score (how many independent factors agree),
+      - a confidence 0..100 (how much real data backed the call),
+      - a plain-English verdict + one-line summary.
+
+    Confluence is deliberately about AGREEMENT across independent signals; a
+    setup where technicals, on-chain flow, derivatives and structure all point
+    the same way is far more trustworthy than one strong factor alone.
+    """
+    factors: Dict[str, float] = {}
+
+    # Technical trend/momentum (from 4H snapshot).
+    tech = 0.0
+    tech += (s4h.get("trend_score", 0) - 1.5) * 26        # -39..+39
+    if s4h.get("macd_hist", 0) > 0:
+        tech += 15
+    rsi = s4h.get("rsi", 50)
+    if 50 <= rsi <= 70:
+        tech += 15
+    elif rsi > 80:
+        tech -= 20
+    factors["technical"] = clamp(tech, -100, 100)
+
+    # Structure / phase (early vs extended).
+    phase = accum.get("phase", "UNKNOWN")
+    factors["structure"] = {
+        "COILED_EARLY": 80, "EARLY_BREAKOUT": 70, "BASING": 45,
+        "NEUTRAL": 0, "EXTENDED": -60, "UNKNOWN": 0,
+    }.get(phase, 0)
+
+    # On-chain flow.
+    eoc = sf(oc_view.get("early_onchain"))
+    oc_f = 0.0
+    if np.isfinite(eoc):
+        oc_f = (eoc - 40) * 1.5
+    lr = oc_view.get("liquidity_risk", "UNKNOWN")
+    oc_f -= {"EXTREME": 70, "HIGH": 35, "MEDIUM": 12}.get(lr, 0)
+    factors["onchain"] = clamp(oc_f, -100, 100)
+
+    # Derivatives (order-book + taker flow + funding).
+    d = 0.0
+    ob = sf(deriv.get("book_imbalance"))
+    fl = sf(deriv.get("flow_imbalance"))
+    if np.isfinite(ob):
+        d += clamp(ob * 120, -50, 50)
+    if np.isfinite(fl):
+        d += clamp(fl * 100, -40, 40)
+    factors["derivatives"] = clamp(d, -100, 100)
+
+    # Market regime.
+    factors["market"] = {"RISK_ON": 40, "MIXED": 0, "RISK_OFF": -45, "UNKNOWN": 0}.get(
+        btc.get("label", "UNKNOWN"), 0)
+
+    # Backtest edge (only if reliable).
+    rel = backtest_reliability(bt)
+    if rel in ("MODERATE", "GOOD") and np.isfinite(bt.expectancy_r):
+        factors["backtest"] = clamp(bt.expectancy_r * 120, -60, 60)
+    else:
+        factors["backtest"] = 0.0
+
+    # Session / time-of-day (Yerevan). Starts from the user's observed pattern;
+    # its weight is learned from real per-session outcomes over time.
+    sess = session_profile()
+    factors["session"] = clamp(sess["session_score"], -100, 100)
+
+    # Confluence = how strongly factors agree, weighted by what the learning
+    # loop has found actually predicts well (defaults to 1.0 each until learned).
+    weights = learned_weights()
+    supportive = [v for v in factors.values() if v > 12]
+    against = [v for v in factors.values() if v < -12]
+    agree = len(supportive)
+    disagree = len(against)
+    wsum = sum(factors.get(k, 0.0) * weights.get(k, 1.0) for k in factors)
+    wtot = sum(weights.get(k, 1.0) for k in factors)
+    raw = wsum / max(1e-9, wtot)  # weighted avg -100..100
+    confluence = clamp(50 + raw * 0.5, 0, 100)
+
+    # Confidence from data completeness (not from how bullish it is).
+    data_bits = [
+        fund_view.get("cap_tier", "UNKNOWN") != "UNKNOWN",
+        bool(oc.get("onchain_ok")),
+        bool(deriv.get("has_futures")),
+        rel in ("LOW", "MODERATE", "GOOD"),
+        np.isfinite(sf(accum.get("accumulation_score"))),
+    ]
+    confidence = int(round(sum(1 for b in data_bits if b) / len(data_bits) * 100))
+
+    # Verdict text.
+    if factors["onchain"] <= -60 or oc_view.get("liquidity_risk") == "EXTREME":
+        verdict = "AVOID"
+        summary = "On-chain liquidity risk makes this un-exitable; skip regardless of upside."
+    elif agree >= 4 and confluence >= 62 and asym >= 60:
+        verdict = "STRONG BUY-WATCH"
+        summary = f"{agree} independent factors align; high room + broad confluence."
+    elif agree >= 3 and confluence >= 55:
+        verdict = "BUY-WATCH"
+        summary = f"{agree} factors supportive; wait for the entry trigger."
+    elif disagree > agree:
+        verdict = "AVOID / WAIT"
+        summary = f"{disagree} factors negative vs {agree} positive; no edge here now."
+    else:
+        verdict = "NEUTRAL"
+        summary = "Mixed signals; not a high-conviction setup."
+
+    return {
+        "verdict": verdict,
+        "verdict_summary": summary,
+        "confluence": int(round(confluence)),
+        "confidence": confidence,
+        "factors_agree": agree,
+        "factors_against": disagree,
+        "factor_scores": {k: round(v, 1) for k, v in factors.items()},
+        "factor_weights": {k: round(weights.get(k, 1.0), 3) for k in factors},
+        "session_label": sess["session_label"],
+        "session_hour_yerevan": sess["session_hour_yerevan"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Risk plan — mechanical entry / stop / staged take-profit + position sizing
+# ---------------------------------------------------------------------------
+
+def trade_plan(
+    s4h: Dict[str, float],
+    s1d: Dict[str, float],
+    accum: Dict[str, float],
+    fund_view: Dict[str, Any],
+    account_usd: float,
+    risk_pct: float,
+) -> Dict[str, Any]:
+    """
+    Produces a fully mechanical plan you can act on:
+      - a concrete ENTRY TRIGGER (not just a zone)
+      - a buy-limit accumulation zone
+      - an invalidation STOP with the reason it is placed there
+      - staged take-profits with suggested % to sell at each
+      - a moonshot RUNNER target scaled to the coin's cap headroom
+      - position size + $ risk for your account and risk tolerance
+    """
+    price = s4h["close"]
+    atrv = max(s4h["atr"], price * 0.004)
+
+    # --- Entry zone: buy into strength-pullback near EMA20 / 20-bar support ---
+    base = max(s4h["support20"], min(price, s4h["ema20"]))
+    low = max(0.0, base - 0.35 * atrv)
+    high = min(price * 1.01, base + 0.25 * atrv)
+    if low > high:
+        low, high = high, low
+    entry = (low + high) / 2.0
+
+    # --- Entry TRIGGER: what must happen before you commit ---
+    # A break/close above the recent 20-bar high with volume confirms the base
+    # is releasing. This keeps you from buying a base that never breaks out.
+    trigger_level = max(s4h["resistance20"], price)
+    entry_trigger = (
+        f"Enter on 4H close above {fmt_price(trigger_level)} with volume > 1.3x "
+        f"average, OR scale a limit bid in the {fmt_price(low)}-{fmt_price(high)} "
+        f"zone while price holds above {fmt_price(s4h['support20'])}."
+    )
+
+    # --- Stop: structural (below base) or ATR, whichever is safer, capped. ---
+    structural_stop = min(s4h["support20"], s1d.get("support20", s4h["support20"])) - 0.45 * atrv
+    atr_stop = entry - 1.8 * atrv
+    stop = min(structural_stop, atr_stop)
+    max_stop = entry * 0.14   # never risk more than ~14% on a single leg
+    if entry - stop > max_stop:
+        stop = entry - max_stop
+    stop = max(stop, 0.0)
+
+    risk = max(entry - stop, entry * 0.005)
+    stop_pct = (entry - stop) / entry * 100 if entry > 0 else np.nan
+
+    # --- Staged take-profits (partial exits) ---
+    # TP1 banks risk quickly; TP2 is the swing target; the RUNNER is the
+    # moonshot leg you let ride toward the cap-implied ceiling.
+    tp1 = entry + 1.5 * risk
+    tp2 = entry + 3.0 * risk
+    if s4h["resistance20"] > tp1:
+        tp1 = max(tp1, s4h["resistance20"])
+
+    # Runner target scaled to headroom: a NANO cap can aim far higher than MID.
+    headroom_x = sf(fund_view.get("headroom_x"), 3)
+    if not np.isfinite(headroom_x) or headroom_x <= 1:
+        headroom_x = 3
+    # Cap the charted runner to something plottable; the headroom note carries
+    # the "this could 50x" context without drawing an absurd single number.
+    runner_mult = clamp(headroom_x, 2, 10)
+    runner = entry * (1 + runner_mult * 0.5)   # conservative fraction of headroom
+
+    # --- Position sizing from account + risk tolerance ---
+    account_usd = max(float(account_usd), 0.0)
+    risk_pct = clamp(float(risk_pct), 0.05, 5.0)
+    risk_budget_usd = account_usd * risk_pct / 100.0
+    per_unit_risk = risk
+    position_units = risk_budget_usd / per_unit_risk if per_unit_risk > 0 else 0.0
+    position_notional = position_units * entry
+
+    return {
+        "entry_trigger": entry_trigger,
+        "entry_low": low,
+        "entry_high": high,
+        "entry_mid": entry,
+        "trigger_level": trigger_level,
+        "stop": stop,
+        "stop_pct": stop_pct,
+        "tp1": tp1,
+        "tp2": tp2,
+        "runner": runner,
+        "runner_mult": runner_mult,
+        "tp1_sell_pct": 40,   # bank 40% at TP1 (removes most risk)
+        "tp2_sell_pct": 35,   # sell 35% at TP2
+        "runner_sell_pct": 25,  # let 25% ride as the moonshot leg
+        "rr_tp1": (tp1 - entry) / risk,
+        "rr_tp2": (tp2 - entry) / risk,
+        "risk_per_unit": per_unit_risk,
+        "risk_budget_usd": risk_budget_usd,
+        "position_units": position_units,
+        "position_notional_usd": position_notional,
+        "account_usd": account_usd,
+        "risk_pct": risk_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Auto discovery
+# ---------------------------------------------------------------------------
+
+def new_listing_radar(max_age_days: float = 30.0, limit: int = 40) -> List[Dict[str, Any]]:
+    """
+    Find recently listed Bitget USDT spot pairs. Fresh listings are where the
+    biggest early moves happen. We estimate listing age from the earliest
+    available daily candle timestamp (cheap and reliable enough for screening).
+
+    Returns rows: {symbol, age_days, turnover, change_24h}.
+    """
+    rows = fetch_all_spot_tickers()
+    out: List[Dict[str, Any]] = []
+    # Rank by turnover first so we only age-check plausibly active new pairs
+    # (age-checking every pair would be hundreds of extra calls).
+    ranked = sorted(
+        (t for t in rows if str(t.get("symbol", "")).upper().endswith("USDT")),
+        key=lambda t: sf(t.get("turnover24h"), 0.0),
+        reverse=True,
+    )
+    checked = 0
+    for t in ranked:
+        if checked >= 120 or len(out) >= limit:
+            break
+        sym = str(t.get("symbol", "")).upper()
+        if any(tag in sym for tag in ("3L", "3S", "5L", "5S", "UP", "DOWN")):
+            continue
+        checked += 1
+        try:
+            df = fetch_candles(sym, "1D", 400, "SPOT")
+        except Exception:
+            continue
+        first_ts = sf(df["timestamp"].iloc[0])
+        if not np.isfinite(first_ts):
+            continue
+        age_days = (now_ms() - first_ts) / 86400000.0
+        if age_days <= max_age_days:
+            out.append({
+                "symbol": sym,
+                "age_days": age_days,
+                "turnover": sf(t.get("turnover24h"), 0.0),
+                "change_24h": sf(t.get("price24hPcnt"), 0.0) * 100,
+            })
+        time.sleep(REQUEST_SLEEP)
+
+    out.sort(key=lambda r: r["age_days"])
+    return out[:limit]
+
+
+def dex_trending_tokens(limit: int = 30) -> List[Dict[str, Any]]:
+    """
+    Pull DexScreener boosted/trending tokens (community-promoted, often where
+    on-chain attention is concentrating). Returns lightweight rows with the
+    token symbol (resolved via a follow-up pair lookup) so they can be matched
+    to Bitget listings when present.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        boosts = _dex_get("/token-boosts/latest/v1")
+    except Exception:
+        return out
+    if not isinstance(boosts, list):
+        return out
+
+    seen = set()
+    for b in boosts:
+        if len(out) >= limit:
+            break
+        chain = str(b.get("chainId", ""))
+        addr = str(b.get("tokenAddress", ""))
+        if not chain or not addr or addr in seen:
+            continue
+        seen.add(addr)
+        out.append({
+            "chain": chain,
+            "address": addr,
+            "description": (b.get("description") or "")[:160],
+            "links": b.get("links") or [],
+            "boost": sf(b.get("totalAmount"), 0.0),
+        })
+    return out
+
+
+def discover_candidates(
+    count: int,
+    min_turnover_usdt: float,
+    max_turnover_usdt: float = 0.0,
+    max_abs_change_pct: float = 80.0,
+    moonshot_mode: bool = True,
+) -> List[str]:
+    """
+    Discover candidates from all Bitget USDT spot pairs.
+
+    moonshot_mode=True (default) deliberately hunts the SMALL end of the market
+    that is starting to wake up, instead of the already-pumped megacaps. It
+    favors coins that:
+      - have enough turnover to be tradeable (min_turnover_usdt) but are not
+        already huge (optionally capped by max_turnover_usdt),
+      - show early positive drift (mild, not vertical),
+    because 100x moves come from small coins BEFORE they trend, not from names
+    that are already up 60% on the day.
+    """
+    rows = fetch_all_spot_tickers()
+    candidates = []
+
+    for t in rows:
+        sym = str(t.get("symbol", "")).upper()
+        if not sym.endswith("USDT"):
+            continue
+        # Skip leveraged tokens and stable-ish wrappers that pollute results.
+        if any(tag in sym for tag in ("3L", "3S", "5L", "5S", "UP", "DOWN")):
+            continue
+
+        turnover = sf(t.get("turnover24h"), 0.0)
+        chg = sf(t.get("price24hPcnt"), 0.0) * 100
+
+        if turnover < min_turnover_usdt:
+            continue
+        if max_turnover_usdt > 0 and turnover > max_turnover_usdt:
+            continue
+        if abs(chg) > max_abs_change_pct:
+            continue
+
+        candidates.append({
+            "symbol": sym,
+            "turnover": turnover,
+            "change": chg,
+        })
+
+    if not candidates:
+        return DEFAULT_SYMBOLS[:count]
+
+    df = pd.DataFrame(candidates)
+
+    if moonshot_mode:
+        # Prefer SMALLER turnover (more room / earlier) but still liquid enough.
+        df["turnover_rank"] = 1.0 - df["turnover"].rank(pct=True)
+        # Favor mild early drift; punish already-vertical 24h pumps.
+        df["momentum_rank"] = df["change"].clip(-15, 25).rank(pct=True)
+        df["discovery_score"] = (
+            0.55 * df["turnover_rank"] +
+            0.45 * df["momentum_rank"]
+        )
+    else:
+        df["turnover_rank"] = df["turnover"].rank(pct=True)
+        df["momentum_rank"] = df["change"].clip(-10, 35).rank(pct=True)
+        df["discovery_score"] = (
+            0.58 * df["momentum_rank"] +
+            0.42 * df["turnover_rank"]
+        )
+
+    # Preserve large liquid anchors for regime comparison.
+    anchors = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    picked = (
+        df.sort_values("discovery_score", ascending=False)
+          .head(max(count, 1))["symbol"]
+          .tolist()
+    )
+
+    for a in reversed(anchors):
+        if a in set(df["symbol"]) and a not in picked:
+            picked.insert(0, a)
+
+    out = []
+    seen = set()
+    for s in picked:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    return out[: max(count, len(anchors))]
+
+
+# ---------------------------------------------------------------------------
+# Full symbol analysis
+# ---------------------------------------------------------------------------
+
+def analyze_symbol(
+    symbol: str,
+    state: Dict[str, Any],
+    btc: Dict[str, Any],
+    cg_cache: Path,
+    account_usd: float = 1000.0,
+    risk_pct: float = 1.0,
+    with_fundamentals: bool = True,
+    with_onchain: bool = True,
+    journal: bool = False,
+) -> Dict[str, Any]:
+    sym = symbol_clean(symbol)
+
+    spot_ticker = fetch_ticker(sym, "SPOT")
+
+    frames: Dict[str, pd.DataFrame] = {}
+    snaps: Dict[str, Dict[str, float]] = {}
+
+    for tf, limit in TIMEFRAMES.items():
+        df = fetch_candles(sym, tf, limit, "SPOT")
+        frames[tf] = df
+        snaps[tf] = snapshot(df)
+        time.sleep(REQUEST_SLEEP)
+
+    deriv = fetch_derivatives_bundle(sym, state)
+    liq = liquidation_proxy(snaps["1H"], snaps["4H"], deriv)
+    deriv.update(liq)
+
+    bt = backtest_core(frames["4H"])
+
+    # Early-accumulation footprint on the daily frame (falls back to 4H).
+    try:
+        accum = accumulation_metrics(frames["1D"])
+        if not np.isfinite(sf(accum.get("accumulation_score"))):
+            accum = accumulation_metrics(frames["4H"])
+    except Exception:
+        accum = accumulation_metrics(frames["4H"])
+
+    # Fundamentals (best-effort; degrades to neutral on failure).
+    if with_fundamentals:
+        fund = fetch_fundamentals(sym, cg_cache, ref_price=snaps["4H"]["close"])
+        time.sleep(REQUEST_SLEEP)
+    else:
+        fund = empty_fundamentals()
+    fund_view = fundamentals_assessment(fund)
+
+    # On-chain / DEX signals (best-effort; degrades to empty on failure).
+    if with_onchain:
+        oc = fetch_onchain(sym, mcap_usd=sf(fund.get("market_cap_usd")))
+        time.sleep(REQUEST_SLEEP)
+    else:
+        oc = empty_onchain()
+    oc_view = onchain_assessment(oc)
+
+    score, reasons, breakdown = score_setup(
+        snaps["1H"],
+        snaps["4H"],
+        snaps["1D"],
+        deriv,
+        btc,
+        bt,
+        spot_ticker,
+        accum,
+    )
+
+    label = signal_label(score, snaps["4H"])
+
+    asym, asym_reasons = asymmetry_score(
+        accum, fund, fund_view, snaps["4H"], spot_ticker, oc, oc_view
+    )
+    tier = moonshot_tier(asym, score, accum.get("phase", "UNKNOWN"))
+
+    verdict = confluence_verdict(
+        score, asym, snaps["4H"], deriv, accum, fund_view, oc, oc_view, bt, btc
+    )
+
+    # Pattern detection, directional (long/short) bias, and discipline guardrails.
+    patterns = detect_patterns(frames["4H"])
+    bias = directional_bias(snaps["4H"], snaps["1D"], accum, patterns, deriv, btc)
+    chg24_for_disc = sf(spot_ticker.get("price24hPcnt"), 0.0) * 100
+    discipline = discipline_check(snaps["4H"], accum, fund, oc_view, chg24_for_disc)
+
+    plan = trade_plan(
+        snaps["4H"], snaps["1D"], accum, fund_view, account_usd, risk_pct
+    )
+
+    # Journal the call so the learning loop can grade it later (bullish only).
+    if journal and "BUY" in str(verdict.get("verdict", "")).upper():
+        try:
+            journal_prediction(
+                sym, verdict["verdict"], verdict["factor_scores"],
+                ref_price=snaps["4H"]["close"], tp1=plan["tp1"], stop=plan["stop"],
+                asym=asym, quality=score, confluence=verdict["confluence"],
+                session_label=verdict.get("session_label"),
+            )
+        except Exception:
+            pass
+
+    chg24 = sf(spot_ticker.get("price24hPcnt"), 0.0) * 100
+    turnover24h = sf(spot_ticker.get("turnover24h"), 0.0)
+
+    all_reasons = (
+        reasons + asym_reasons
+        + list(fund_view.get("fund_notes", []))
+        + list(oc_view.get("onchain_notes", []))
+    )
+
+    return {
+        "symbol": sym,
+        "moonshot_score": score,
+        "asymmetry_score": asym,
+        "verdict": verdict["verdict"],
+        "verdict_summary": verdict["verdict_summary"],
+        "confluence": verdict["confluence"],
+        "confidence": verdict["confidence"],
+        "factors_agree": verdict["factors_agree"],
+        "factor_scores": json.dumps(verdict["factor_scores"], ensure_ascii=False),
+        "factor_weights": json.dumps(verdict.get("factor_weights", {}), ensure_ascii=False),
+        "session_label": verdict.get("session_label"),
+        "session_hour_yerevan": verdict.get("session_hour_yerevan"),
+
+        # Direction, patterns, discipline guardrails
+        "direction": bias["direction"],
+        "direction_score": bias["direction_score"],
+        "patterns": json.dumps(patterns.get("patterns", []), ensure_ascii=False),
+        "pattern_bias": patterns.get("pattern_bias", 0.0),
+        "discipline_stance": discipline["discipline_stance"],
+        "is_chase": discipline["is_chase"],
+        "discipline_warnings": json.dumps(discipline["discipline_warnings"], ensure_ascii=False),
+        "max_leverage_suggested": discipline["max_leverage_suggested"],
+        "leverage_note": discipline["leverage_note"],
+        "moonshot_tier": tier,
+        "signal": label,
+        "price": snaps["4H"]["close"],
+        "change_24h_pct": chg24,
+        "turnover_24h_usdt": turnover24h,
+
+        # Fundamentals
+        "cap_tier": fund_view.get("cap_tier"),
+        "market_cap_usd": fund.get("market_cap_usd"),
+        "fdv_usd": fund.get("fdv_usd"),
+        "fdv_mcap_ratio": fund.get("fdv_mcap_ratio"),
+        "circulating_pct": fund.get("circulating_pct"),
+        "market_cap_rank": fund.get("market_cap_rank"),
+        "down_from_ath_pct": fund.get("down_from_ath_pct"),
+        "chg_7d_pct": fund.get("chg_7d_pct"),
+        "chg_30d_pct": fund.get("chg_30d_pct"),
+        "headroom_x": fund_view.get("headroom_x"),
+
+        # Accumulation / phase
+        "phase": accum.get("phase"),
+        "accumulation_score": accum.get("accumulation_score"),
+        "range_compression_pct": accum.get("range_compression_pct"),
+        "vol_wakeup_ratio": accum.get("vol_wakeup_ratio"),
+        "dist_from_base_pct": accum.get("dist_from_base_pct"),
+
+        # On-chain / DEX
+        "onchain_ok": oc.get("onchain_ok"),
+        "early_onchain": oc_view.get("early_onchain"),
+        "liquidity_risk": oc_view.get("liquidity_risk"),
+        "dex_liquidity_usd": oc.get("dex_liquidity_usd"),
+        "dex_vol_h24": oc.get("dex_vol_h24"),
+        "dex_buy_sell_ratio_h24": oc.get("dex_buy_sell_ratio_h24"),
+        "dex_buy_sell_ratio_h1": oc.get("dex_buy_sell_ratio_h1"),
+        "dex_pair_age_days": oc.get("dex_pair_age_days"),
+        "dex_chain": oc.get("dex_chain"),
+        "liquidity_mcap_ratio": oc.get("liquidity_mcap_ratio"),
+
+        "rsi_4h": snaps["4H"]["rsi"],
+        "volume_ratio_4h": snaps["4H"]["vol_ratio"],
+        "turnover_ratio_4h": snaps["4H"]["turnover_ratio"],
+        "trend_1h": snaps["1H"]["trend_score"],
+        "trend_4h": snaps["4H"]["trend_score"],
+        "trend_1d": snaps["1D"]["trend_score"],
+
+        "has_futures": deriv["has_futures"],
+        "open_interest": deriv["open_interest"],
+        "oi_usdt": deriv["oi_usdt"],
+        "oi_delta_pct": deriv["oi_delta_pct"],
+        "oi_baseline_age_min": deriv["oi_baseline_age_min"],
+        "funding_rate": deriv["funding_rate"],
+        "funding_z": deriv["funding_z"],
+
+        "orderbook_imbalance": deriv["book_imbalance"],
+        "futures_bid_share": deriv["bid_share"],
+        "spread_bps": deriv["spread_bps"],
+        "taker_buy_ratio": deriv["buy_ratio"],
+        "taker_flow_imbalance": deriv["flow_imbalance"],
+
+        "liquidation_proxy": deriv["liq_proxy"],
+        "liquidation_proxy_strength": deriv["liq_proxy_strength"],
+
+        "bt_trades": bt.trades,
+        "bt_win_rate_pct": bt.win_rate,
+        "bt_expectancy_r": bt.expectancy_r,
+        "bt_profit_factor": bt.profit_factor,
+        "bt_max_drawdown_r": bt.max_drawdown_r,
+        "bt_reliability": backtest_reliability(bt),
+
+        "entry_trigger": plan["entry_trigger"],
+        "entry_low": plan["entry_low"],
+        "entry_high": plan["entry_high"],
+        "trigger_level": plan["trigger_level"],
+        "stop": plan["stop"],
+        "stop_pct": plan["stop_pct"],
+        "tp1": plan["tp1"],
+        "tp2": plan["tp2"],
+        "runner": plan["runner"],
+        "runner_mult": plan["runner_mult"],
+        "tp1_sell_pct": plan["tp1_sell_pct"],
+        "tp2_sell_pct": plan["tp2_sell_pct"],
+        "runner_sell_pct": plan["runner_sell_pct"],
+        "rr_tp1": plan["rr_tp1"],
+        "rr_tp2": plan["rr_tp2"],
+        "position_units": plan["position_units"],
+        "position_notional_usd": plan["position_notional_usd"],
+        "risk_budget_usd": plan["risk_budget_usd"],
+        "account_usd": plan["account_usd"],
+        "risk_pct": plan["risk_pct"],
+
+        "btc_regime": btc.get("label"),
+        "score_breakdown": json.dumps(breakdown, ensure_ascii=False),
+        "reasons": " | ".join(all_reasons),
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Console
+# ---------------------------------------------------------------------------
+
+def _usd(x: float) -> str:
+    v = sf(x)
+    if not np.isfinite(v):
+        return "-"
+    if abs(v) >= 1_000_000_000:
+        return f"${v/1e9:.2f}B"
+    if abs(v) >= 1_000_000:
+        return f"${v/1e6:.2f}M"
+    if abs(v) >= 1_000:
+        return f"${v/1e3:.1f}K"
+    return f"${v:,.0f}"
+
+
+def print_result(r: Dict[str, Any]) -> None:
+    funding = sf(r.get("funding_rate"))
+    fund_str = "-" if not np.isfinite(funding) else f"{funding:.4%}"
+
+    oi_delta = sf(r.get("oi_delta_pct"))
+    oi_str = "-" if not np.isfinite(oi_delta) else f"{oi_delta:+.2f}%"
+
+    ob = sf(r.get("orderbook_imbalance"))
+    ob_str = "-" if not np.isfinite(ob) else f"{ob:+.3f}"
+
+    flow = sf(r.get("taker_flow_imbalance"))
+    flow_str = "-" if not np.isfinite(flow) else f"{flow:+.3f}"
+
+    print("\n" + "=" * 88)
+    print(
+        f"{r['symbol']} | {r['signal']} | {r.get('moonshot_tier', '-')}"
+    )
+    print(
+        f"Trade-quality {r['moonshot_score']}/100   "
+        f"Asymmetry(upside room + earliness) {r.get('asymmetry_score', '-')}/100"
+    )
+    print("-" * 88)
+    print(
+        f"Price {fmt_price(r['price'])} | 24h {r['change_24h_pct']:+.2f}% | "
+        f"Turnover ${r['turnover_24h_usdt']:,.0f}"
+    )
+
+    # Fundamentals line
+    mcap = sf(r.get("market_cap_usd"))
+    fdvr = sf(r.get("fdv_mcap_ratio"))
+    circ = sf(r.get("circulating_pct"))
+    d_ath = sf(r.get("down_from_ath_pct"))
+    print(
+        f"Fundamentals: cap {r.get('cap_tier', '-')} ({_usd(mcap)}) | "
+        f"FDV/mcap {('-' if not np.isfinite(fdvr) else f'{fdvr:.1f}x')} | "
+        f"circ {('-' if not np.isfinite(circ) else f'{circ:.0f}%')} | "
+        f"{('-' if not np.isfinite(d_ath) else f'{d_ath:.0f}% below ATH')}"
+    )
+
+    # Phase / accumulation line
+    acc = sf(r.get("accumulation_score"))
+    comp = sf(r.get("range_compression_pct"))
+    wake = sf(r.get("vol_wakeup_ratio"))
+    print(
+        f"Phase: {r.get('phase', '-')} | accumulation {('-' if not np.isfinite(acc) else f'{acc:.0f}/100')} | "
+        f"compression {('-' if not np.isfinite(comp) else f'{comp:.0f}%')} | "
+        f"vol wake-up {('-' if not np.isfinite(wake) else f'{wake:.2f}x')}"
+    )
+
+    print(
+        f"Trend 1H/4H/1D: {r['trend_1h']}/3 {r['trend_4h']}/3 {r['trend_1d']}/3 | "
+        f"RSI4H {r['rsi_4h']:.1f} | Vol {r['volume_ratio_4h']:.2f}x"
+    )
+    print(
+        f"OI Δ {oi_str} | Funding {fund_str} | "
+        f"Book {ob_str} | Taker Flow {flow_str}"
+    )
+    print(
+        f"Liquidation proxy: {r['liquidation_proxy']} "
+        f"({r['liquidation_proxy_strength']:.0f}/100)"
+    )
+
+    # On-chain / DEX line
+    if r.get("onchain_ok"):
+        eoc = sf(r.get("early_onchain"))
+        bs1 = sf(r.get("dex_buy_sell_ratio_h1"))
+        age = sf(r.get("dex_pair_age_days"))
+        print(
+            f"On-chain [{r.get('dex_chain','?')}]: early {('-' if not np.isfinite(eoc) else f'{eoc:.0f}/100')} | "
+            f"liq {_usd(sf(r.get('dex_liquidity_usd')))} | "
+            f"risk {r.get('liquidity_risk','-')} | "
+            f"buy1h {('-' if not np.isfinite(bs1) else f'{bs1*100:.0f}%')} | "
+            f"age {('-' if not np.isfinite(age) else f'{age:.0f}d')}"
+        )
+
+    rel = r.get("bt_reliability", "NONE")
+    if r["bt_trades"] > 0:
+        pf = r["bt_profit_factor"]
+        pf_s = "inf" if np.isinf(pf) else f"{pf:.2f}"
+        note = "  (too few trades to trust)" if rel in ("INSUFFICIENT", "NONE") else f"  [{rel}]"
+        print(
+            f"Backtest: {r['bt_trades']} trades | "
+            f"WR {r['bt_win_rate_pct']:.1f}% | "
+            f"E {r['bt_expectancy_r']:+.2f}R | PF {pf_s} (net of fees){note}"
+        )
+    else:
+        print("Backtest: insufficient sample")
+
+    # ---- Actionable trade plan ----
+    print("-" * 88)
+    print("TRADE PLAN")
+    print(f"  ENTRY   : {r.get('entry_trigger', '-')}")
+    print(
+        f"            limit zone {fmt_price(r['entry_low'])} - {fmt_price(r['entry_high'])}"
+    )
+    stop_pct = sf(r.get("stop_pct"))
+    print(
+        f"  STOP    : {fmt_price(r['stop'])} "
+        f"({'-' if not np.isfinite(stop_pct) else f'-{stop_pct:.1f}%'}) "
+        f"— close the trade if it trades below this (setup invalidated)"
+    )
+    print(
+        f"  TP1     : {fmt_price(r['tp1'])} (RR {r['rr_tp1']:.2f}) "
+        f"— sell {r.get('tp1_sell_pct', 40)}%, move stop to break-even"
+    )
+    print(
+        f"  TP2     : {fmt_price(r['tp2'])} (RR {r['rr_tp2']:.2f}) "
+        f"— sell {r.get('tp2_sell_pct', 35)}%"
+    )
+    rm = sf(r.get("runner_mult"))
+    print(
+        f"  RUNNER  : {fmt_price(r['runner'])}+ — let {r.get('runner_sell_pct', 25)}% ride "
+        f"(trail it); cap headroom ~{('-' if not np.isfinite(rm) else f'{rm:.0f}x')} region"
+    )
+
+    # ---- Position sizing ----
+    acct = sf(r.get("account_usd"))
+    rpct = sf(r.get("risk_pct"))
+    rbudget = sf(r.get("risk_budget_usd"))
+    notional = sf(r.get("position_notional_usd"))
+    units = sf(r.get("position_units"))
+    if np.isfinite(acct) and acct > 0:
+        print(
+            f"  SIZE    : risk {('-' if not np.isfinite(rpct) else f'{rpct:.2f}%')} of "
+            f"{_usd(acct)} = {_usd(rbudget)} at risk | "
+            f"buy ~{_usd(notional)} notional "
+            f"({'-' if not np.isfinite(units) else f'{units:,.4g}'} units)"
+        )
+
+    print(f"Why: {r['reasons']}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Bitget Moonshot Scanner v2 — finds early high-asymmetry setups "
+            "(fundamentals + accumulation + derivatives + backtest) and gives "
+            "mechanical entry / stop / take-profit / position sizing."
+        )
+    )
+
+    parser.add_argument(
+        "symbols",
+        nargs="*",
+        help="Specific symbols, e.g. MYXUSDT SUIUSDT BTCUSDT",
+    )
+    parser.add_argument(
+        "--auto",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Auto-discover and deeply scan N USDT spot candidates",
+    )
+    parser.add_argument(
+        "--min-turnover",
+        type=float,
+        default=1_000_000,
+        help="Minimum 24h spot turnover in USDT for --auto (default 1,000,000)",
+    )
+    parser.add_argument(
+        "--max-turnover",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum 24h spot turnover for --auto. In moonshot mode this keeps "
+            "the scan on smaller coins with room to run (0 = no cap)."
+        ),
+    )
+    parser.add_argument(
+        "--classic-discovery",
+        action="store_true",
+        help="Use the old momentum+liquidity discovery instead of moonshot (small/early) mode",
+    )
+    parser.add_argument(
+        "--account",
+        type=float,
+        default=1000.0,
+        help="Account size in USDT for position sizing (default 1000)",
+    )
+    parser.add_argument(
+        "--risk",
+        type=float,
+        default=1.0,
+        help="Percent of account risked per trade for sizing (default 1.0)",
+    )
+    parser.add_argument(
+        "--no-fundamentals",
+        action="store_true",
+        help="Skip CoinGecko fundamentals (faster, but no cap/FDV/supply context)",
+    )
+    parser.add_argument(
+        "--min-asymmetry",
+        type=int,
+        default=0,
+        help="Only print/rank coins with asymmetry score >= this (0 = show all)",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=15,
+        help="How many final ranked rows to print (default 15)",
+    )
+    parser.add_argument("--csv", default="moonshot_scan_results.csv", help="CSV output path")
+    parser.add_argument("--json", default="moonshot_scan_results.json", help="JSON output path")
+    parser.add_argument(
+        "--state",
+        default=DEFAULT_STATE_FILE,
+        help="Local OI state file used to calculate OI change between runs",
+    )
+
+    args = parser.parse_args()
+
+    state_path = Path(args.state)
+    state = load_state(state_path)
+    cg_cache = Path(COINGECKO_LIST_CACHE)
+    with_fundamentals = not args.no_fundamentals
+
+    print("Loading BTC regime...")
+    btc = btc_regime()
+    print(
+        f"BTC regime: {btc['label']} | score {btc['score']}/4 | "
+        f"RSI4H {btc['rsi']:.1f}"
+    )
+
+    if args.auto > 0:
+        mode = "classic" if args.classic_discovery else "moonshot (small/early)"
+        print(
+            f"Discovering {args.auto} candidates [{mode}] "
+            f"(24h turnover ${args.min_turnover:,.0f}"
+            f"{'' if args.max_turnover <= 0 else f' - ${args.max_turnover:,.0f}'})..."
+        )
+        symbols = discover_candidates(
+            args.auto,
+            args.min_turnover,
+            max_turnover_usdt=args.max_turnover,
+            moonshot_mode=not args.classic_discovery,
+        )
+    elif args.symbols:
+        symbols = [symbol_clean(s) for s in args.symbols]
+    else:
+        symbols = DEFAULT_SYMBOLS
+
+    print("Candidates:", ", ".join(symbols))
+
+    results: List[Dict[str, Any]] = []
+
+    for idx, sym in enumerate(symbols, start=1):
+        print(f"\n[{idx}/{len(symbols)}] Analyzing {sym}...")
+        try:
+            r = analyze_symbol(
+                sym, state, btc, cg_cache,
+                account_usd=args.account,
+                risk_pct=args.risk,
+                with_fundamentals=with_fundamentals,
+            )
+            results.append(r)
+            print_result(r)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"[SKIP] {sym}: {e}", file=sys.stderr)
+
+        time.sleep(REQUEST_SLEEP)
+
+    # Persist OI snapshots even if some symbols fail after futures ticker fetch.
+    try:
+        save_state(state_path, state)
+    except Exception as e:
+        print(f"[WARN] Could not save OI state: {e}", file=sys.stderr)
+
+    if not results:
+        print("\nNo symbols could be analyzed.")
+        sys.exit(1)
+
+    out = pd.DataFrame(results)
+
+    # Combined moonshot ranking: reward BOTH asymmetry (room + earliness) and
+    # a workable setup right now. Asymmetry weighted higher because the whole
+    # point is catching size, not scalping a large cap.
+    out["combined_rank"] = (
+        0.6 * out["asymmetry_score"].astype(float).fillna(0)
+        + 0.4 * out["moonshot_score"].astype(float).fillna(0)
+    )
+
+    if args.min_asymmetry > 0:
+        out = out[out["asymmetry_score"].astype(float).fillna(0) >= args.min_asymmetry]
+        if out.empty:
+            print(
+                f"\nNo coins met --min-asymmetry {args.min_asymmetry}. "
+                "Lower the threshold or widen the scan."
+            )
+            sys.exit(0)
+
+    out = out.sort_values(
+        ["combined_rank", "turnover_24h_usdt"],
+        ascending=[False, False],
+    )
+
+    out.to_csv(args.csv, index=False)
+
+    with open(args.json, "w", encoding="utf-8") as f:
+        json.dump(
+            out.replace({np.nan: None, np.inf: None, -np.inf: None})
+               .to_dict(orient="records"),
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print("\n" + "=" * 88)
+    print("FINAL MOONSHOT RANKING (sorted by asymmetry + setup quality)")
+    print("=" * 88)
+
+    show = out.head(max(args.top, 1)).copy()
+
+    cols = [
+        "symbol",
+        "moonshot_tier",
+        "asymmetry_score",
+        "moonshot_score",
+        "cap_tier",
+        "phase",
+        "change_24h_pct",
+        "chg_30d_pct",
+        "rsi_4h",
+        "vol_wakeup_ratio",
+        "bt_trades",
+        "bt_win_rate_pct",
+    ]
+    cols = [c for c in cols if c in show.columns]
+
+    with pd.option_context(
+        "display.max_columns", None,
+        "display.width", 240,
+        "display.max_colwidth", 18,
+    ):
+        print(show[cols].to_string(index=False))
+
+    print(f"\nCSV  : {args.csv}")
+    print(f"JSON : {args.json}")
+    print(f"OI state: {state_path}")
+    print("\n" + "-" * 88)
+    print("HOW TO READ THIS")
+    print("-" * 88)
+    print(
+        "- ASYMMETRY score = upside room (small cap) + earliness (coiled/basing).\n"
+        "  High asymmetry is where 10x-100x is physically possible. It is NOT a\n"
+        "  probability. Most high-asymmetry coins still fail; size accordingly.\n"
+        "- TRADE-QUALITY score = is the setup clean/tradeable right now.\n"
+        "- PRIME MOONSHOT = both are high. SPECULATIVE = big room but unproven.\n"
+        "- Follow the per-coin TRADE PLAN: enter on the trigger, respect the STOP,\n"
+        "  take partials at TP1/TP2, let the RUNNER ride with a trailing stop.\n"
+        "- Position SIZE is computed so a stop-out loses only your chosen --risk %."
+    )
+    print(
+        "\nRISK: nano/micro caps are illiquid and can go to zero. News, unlocks,\n"
+        "exploits, and delistings move them violently. Never risk money you need.\n"
+        "OI delta becomes meaningful only from the SECOND run onward."
+    )
+
+
+if __name__ == "__main__":
+    main()

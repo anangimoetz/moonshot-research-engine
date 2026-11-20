@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-11-20",
+  "policy": "Project IDs are curated. DEX pools require an exact independently sourced chain and contract. A ticker search never verifies identity. Entries with no contracts cannot contribute DEX liquidity.",
+  "quote_contracts": [
+    {"chain": "bsc", "symbol": "USDT", "address": "0x55d398326f99059fF775485246999027B3197955", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet", "representation": "Binance-Peg"},
+    {"chain": "bsc", "symbol": "USDC", "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet", "representation": "Binance-Peg"},
+    {"chain": "ethereum", "symbol": "USDT", "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet"},
+    {"chain": "ethereum", "symbol": "USDC", "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet"},
+    {"chain": "solana", "symbol": "USDT", "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet"},
+    {"chain": "solana", "symbol": "USDC", "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet"},
+    {"chain": "base", "symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "source": "https://www.binance.com/en/skills/detail/binance-web3/binance-agentic-wallet"}
+  ],
+  "assets": {
+    "BTC": {"name": "Bitcoin", "coingecko_id": "bitcoin", "official_sources": ["https://bitcoin.org/", "https://www.coingecko.com/en/coins/bitcoin"], "contracts": [], "native": true},
+    "ETH": {"name": "Ethereum", "coingecko_id": "ethereum", "official_sources": ["https://ethereum.org/", "https://www.coingecko.com/en/coins/ethereum"], "contracts": [], "native": true},
+    "SOL": {"name": "Solana", "coingecko_id": "solana", "official_sources": ["https://solana.com/docs/tokens/basics/sync-native", "https://www.coingecko.com/en/coins/solana"], "contracts": [{"chain": "solana", "address": "So11111111111111111111111111111111111111112", "source": "https://solana.com/docs/tokens/basics/sync-native", "representation": "wrapped_native"}], "native": true},
+    "LINK": {"name": "Chainlink", "coingecko_id": "chainlink", "official_sources": ["https://docs.chain.link/resources/link-token-contracts", "https://github.com/smartcontractkit/LinkToken"], "contracts": [{"chain": "ethereum", "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "source": "https://github.com/smartcontractkit/LinkToken"}]},
+    "NEAR": {"name": "NEAR Protocol", "coingecko_id": "near", "official_sources": ["https://near.org/", "https://www.coingecko.com/en/coins/near"], "contracts": [], "native": true},
+    "ICP": {"name": "Internet Computer", "coingecko_id": "internet-computer", "official_sources": ["https://internetcomputer.org/", "https://www.coingecko.com/en/coins/internet-computer"], "contracts": [], "native": true},
+    "XRP": {"name": "XRP", "coingecko_id": "ripple", "official_sources": ["https://xrpl.org/", "https://www.coingecko.com/en/coins/xrp"], "contracts": [], "native": true},
+    "BNB": {"name": "BNB", "coingecko_id": "binancecoin", "official_sources": ["https://www.bnbchain.org/", "https://www.coingecko.com/en/coins/bnb"], "contracts": [], "native": true},
+    "HYPE": {"name": "Hyperliquid", "coingecko_id": "hyperliquid", "official_sources": ["https://hyperliquid.gitbook.io/hyperliquid-docs", "https://www.coingecko.com/en/coins/hyperliquid"], "contracts": [], "native": true},
+    "EVAA": {"name": "EVAA Protocol", "coingecko_id": "evaa-protocol", "official_sources": ["https://evaa.gitbook.io/evaa-docs-2.0/details-of-protocol/token-and-tokenomics/usdevaa-token"], "contracts": [{"chain": "ton", "address": "EQBKMfjX_a_dsOLm-juxyVZytFP7_KKnzGv6J01kGc72gVBp", "source": "https://evaa.gitbook.io/evaa-docs-2.0/details-of-protocol/token-and-tokenomics/usdevaa-token"}, {"chain": "bsc", "address": "0xaa036928c9c0Df07d525B55ea8EE690Bb5a628C1", "source": "https://evaa.gitbook.io/evaa-docs-2.0/details-of-protocol/token-and-tokenomics/usdevaa-token"}]},
+    "BLESS": {"name": "Bless Network", "coingecko_id": "bless-2", "official_sources": ["https://bless.network/mica/whitepaper.pdf", "https://www.coingecko.com/en/coins/bless"], "contracts": [], "contract_review_status": "PENDING_PRIMARY_SOURCE", "note": "Project and API ID matched; do not use same-ticker Solana pools until official contract mapping is reviewed. CoinGecko API ID is bless-2, not bless."}
+  }
+}

@@ -1,0 +1,49 @@
+# Always-on configuration uses a PAID service and a persistent disk.
+# Creating/applying this Blueprint can incur Render charges. Nothing is deployed by this file alone.
+services:
+  - type: web
+    name: moonshot-research-engine
+    runtime: python
+    plan: starter
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m moonshot_scanner.supervise
+    healthCheckPath: /healthz
+    autoDeploy: false
+    disk:
+      name: research-state
+      mountPath: /var/data/moonshot
+      sizeGB: 1
+    envVars:
+      - key: SCANNER_TOKEN
+        generateValue: true
+      - key: SCANNER_READ_TOKEN
+        generateValue: true
+      - key: SCANNER_SESSION_SECRET
+        generateValue: true
+      - key: SCANNER_STATE_DIR
+        value: /var/data/moonshot
+      - key: SCANNER_PERSISTENT_STORAGE
+        value: "1"
+      - key: SCANNER_AUTO_SCAN
+        value: "1"
+      - key: SCANNER_SCAN_INTERVAL_SECONDS
+        value: "300"
+      - key: SCANNER_AUTO_LIMIT
+        value: "12"
+      - key: SCANNER_EXCHANGES
+        value: bitget,binance,bybit
+      - key: SCANNER_COOKIE_SECURE
+        value: "1"
+      - key: SCANNER_TRUST_PROXY
+        value: "1"
+      - key: SCANNER_ROSE_ENABLED
+        value: "0"
+      - key: SCANNER_TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SCANNER_TELEGRAM_CHAT_ID
+        value: "6720326248"
+      - key: SCANNER_REQUIRE_TELEGRAM
+        value: "1"
+      - key: SCANNER_STARTUP_NOTICE
+        value: "1"

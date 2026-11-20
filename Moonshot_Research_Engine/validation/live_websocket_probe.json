@@ -1,0 +1,32 @@
+{
+  "fetched_at": "2026-11-20T08:05:44.752Z",
+  "results": [
+    {
+      "exchange": "bitget",
+      "transport": "PUBLIC_WEBSOCKET",
+      "status": "MARKET_UPDATE_RECEIVED",
+      "elapsed_ms": 1869,
+      "observed_at_ms": 1795161944378,
+      "event_age_ms": -1266,
+      "price": 61809.27
+    },
+    {
+      "exchange": "binance",
+      "transport": "PUBLIC_WEBSOCKET",
+      "status": "MARKET_UPDATE_RECEIVED",
+      "elapsed_ms": 3431,
+      "observed_at_ms": 1795161946014,
+      "event_age_ms": -1262,
+      "price": 61810.7
+    },
+    {
+      "exchange": "bybit",
+      "transport": "PUBLIC_WEBSOCKET",
+      "status": "MARKET_UPDATE_RECEIVED",
+      "elapsed_ms": 1274,
+      "observed_at_ms": 1795161942940,
+      "event_age_ms": -344,
+      "price": 61809.3
+    }
+  ]
+}

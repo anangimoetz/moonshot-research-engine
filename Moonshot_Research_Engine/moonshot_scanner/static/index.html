@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Moonshot Research Console</title><link rel="stylesheet" href="/static/style.css"><script defer src="/static/vendor/lightweight-charts.js"></script><script defer src="/static/live-chart.js"></script><script defer src="/static/app.js"></script></head>
+<body>
+<header><div><span class="eyebrow">PUBLIC MARKET RESEARCH · V3</span><h1>Moonshot Research Console</h1><p>Temukan perubahan aktivitas. Tunggu bukti untuk entry.</p></div><div id="clock" class="clock">Armenia · WIB</div></header>
+<main>
+<section id="loginPanel" class="panel login"><h2>Akses scanner</h2><p>Masukkan token aplikasi Anda. Token tidak disimpan dalam localStorage.</p><form id="loginForm"><input id="accessToken" type="password" autocomplete="current-password" placeholder="Token akses" required><button>Masuk</button></form><p id="loginError" class="danger"></p></section>
+<div id="workspace" hidden>
+<section class="health panel"><div><span class="eyebrow">STATUS OPERASI</span><strong id="healthTitle">Memeriksa worker…</strong><p id="healthDetail"></p></div><span id="roseState" class="badge neutral">Rose: belum tersambung</span></section>
+<section class="panel controls"><form id="scanForm">
+<label>Exchange<select id="exchange"><option value="all">Bitget + Binance + Bybit</option value="bitget" selected>Bitget</option><option value="binance">Binance</option><option value="bybit">Bybit</option></select></label>
+<label>Simbol USDT<input id="symbols" placeholder="Kosong = discovery bergilir"></label>
+<label>Kandidat / exchange<input id="limit" type="number" value="12" min="1" max="50"></label>
+<label>Modal contoh (USD)<input id="account" type="number" value="1000" min="1"></label>
+<label>Risiko contoh (%)<input id="risk" type="number" value="1" min="0.01" max="1" step="0.1"></label>
+<button id="scanBtn">Jalankan riset</button>
+</form><div id="scanStatus" role="status">Belum ada scan pada sesi ini.</div></section>
+<section class="metrics"><div class="panel"><small>KANDIDAT TERSIMPAN</small><strong id="count">0</strong></div><div class="panel"><small>AKTIVITAS AWAL</small><strong id="early">0</strong></div><div class="panel"><small>ENTRY TERKONFIRMASI</small><strong id="ready">0</strong></div><div class="panel"><small>MODEL PROBABILITAS</small><strong class="small">Belum tervalidasi</strong></div></section>
+<div class="sectionHead"><h2>Radar independen</h2><div class="filters"><button class="filter active" data-filter="all">Semua</button><button class="filter" data-filter="early">EARLY</button><button class="filter" data-filter="ready">READY</button><button class="filter" data-filter="missing">Data belum lengkap</button><button id="refresh">Perbarui tampilan</button></div></div>
+<div class="grid"><section class="panel tablepanel"><div class="tablewrap"><table><thead><tr><th>Aset / exchange</th><th>Tahap</th><th>Bias</th><th>Aktivitas¹</th><th>TA 4h</th><th>Cakupan</th><th>Harga</th><th>Umur tick</th></tr></thead><tbody id="rows"></tbody></table></div><p id="empty" class="empty">Jalankan scan. Tidak ada kandidat yang dipaksakan menjadi entry.</p><p class="footnote">¹ Ranking aktivitas, bukan peluang naik. UNKNOWN berarti belum diperiksa, bukan risiko rendah.</p></section><section id="detail" class="panel detail"><div class="empty">Pilih kandidat untuk melihat sumber, struktur, dan alasan menunggu.</div></section></div>
+<section class="panel"><div class="sectionHead"><h2>Watchlist dengan rencana tetap</h2><span class="muted">Level tidak dipindahkan saat harga berubah</span></div><div id="watches" class="empty">Belum ada rencana dipantau.</div></section>
+<section class="panel"><h2>Jadwal sesi</h2><p class="muted">Armenia lebih dahulu, WIB dalam kurung. Jam London/New York mengikuti DST. Kalender hari libur dan rilis makro harus diverifikasi terpisah.</p><div id="sessions" class="sessionGrid"></div></section>
+<section class="panel"><h2>Kesalahan dan data yang belum tersedia</h2><div id="errors" class="muted">Kesalahan per sumber dan kandidat akan muncul di sini.</div></section>
+<footer>Discovery ≠ entry. READY berarti pemeriksaan setup terpenuhi pada waktunya; bukan probabilitas profit. Aplikasi ini tidak mengeksekusi transaksi.</footer>
+</div></main></body></html>

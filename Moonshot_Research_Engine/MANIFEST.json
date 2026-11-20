@@ -1,0 +1,254 @@
+{
+  ".env.example": {
+    "bytes": 696,
+    "sha256": "bf263f22bb5b6358f121a7ad66614eb24c0ebc9745f4603275fc02e4ac4a0fbb"
+  },
+  ".github/workflows/checks.yml": {
+    "bytes": 707,
+    "sha256": "b9741261a7fadb8a318b2c11923f1639844e86291a6e690e0fa6cb2d58746612"
+  },
+  ".gitignore": {
+    "bytes": 118,
+    "sha256": "d92c31f955196573c37c54f621ad49cb640a36406a81edee1daada99342aad87"
+  },
+  "docs/Bitget_Moonshot_Scanner_Audit_2026-11-20.md": {
+    "bytes": 13953,
+    "sha256": "c61f8a34c8a1637dff8fced02dad796dde0120c9a3df1426e4f4213b3ac3b5e2"
+  },
+  "docs/EVIDENCE_AND_ACCEPTANCE.md": {
+    "bytes": 2495,
+    "sha256": "c20bfa7ccba223f53e435d1201cf85654f82adc1a0c9a11191ef6c5a63eda819"
+  },
+  "docs/Moonshot_Upgrade_Repository_Review_2026-11-20.md": {
+    "bytes": 12711,
+    "sha256": "035d8ee0eaaae806f8531c53cf28391c0a3d5cd5b82a2dccb2945deb6aad9533"
+  },
+  "moonshot_scanner/__init__.py": {
+    "bytes": 105,
+    "sha256": "a0805d6a4094be38db0b34dd97b0b63bfd0f34ae063ce1ab0fcd706479983cfb"
+  },
+  "moonshot_scanner/__main__.py": {
+    "bytes": 2120,
+    "sha256": "f7c517cff905701e150a99bdcedb9d67d2839cf613a876feb85024980023b098"
+  },
+  "moonshot_scanner/app.py": {
+    "bytes": 18544,
+    "sha256": "4ed720e35f62ad4e43fbac18f2b698ca4305b84ef87415cf4dc9b852fa8709cc"
+  },
+  "moonshot_scanner/asset_registry.json": {
+    "bytes": 4778,
+    "sha256": "2ff2067a18f78990ad8cdd5270f089d5e8a2fdae8b49aa4b1949257f6bc15f7d"
+  },
+  "moonshot_scanner/backtest.py": {
+    "bytes": 12217,
+    "sha256": "0f74df0035924170ca8d4a8c307b47e265a200d542510a37e953fcbdc153cdd3"
+  },
+  "moonshot_scanner/chart_data.py": {
+    "bytes": 2970,
+    "sha256": "caa5c65d16c6c552130d1a50ef78808a9820400cd73dd1713bc21062d1d12efe"
+  },
+  "moonshot_scanner/config.py": {
+    "bytes": 3377,
+    "sha256": "6fda5ce0d3fd3332dc2a8c33bd1012c65807a5aca4ed1c07002c21a7ef188aa5"
+  },
+  "moonshot_scanner/features.py": {
+    "bytes": 11058,
+    "sha256": "52174a5be31b130f2cf8a217cec9686c7e8c0a9280e331034b43b795dc5ff1bd"
+  },
+  "moonshot_scanner/identity.py": {
+    "bytes": 9072,
+    "sha256": "1687fa4bf13f5ee578e91ff2b50e879dff73522ff13105de015bc773fd938204"
+  },
+  "moonshot_scanner/pipeline.py": {
+    "bytes": 22254,
+    "sha256": "83d277f340a5c4f27e1a6a4fc4790960c7599fac12c2838c55cc64971179d608"
+  },
+  "moonshot_scanner/plans.py": {
+    "bytes": 10923,
+    "sha256": "70432b0be43da626c2ea6cad3efbd1195d0fc82aeafc1ecf4463cceef7b79548"
+  },
+  "moonshot_scanner/providers.py": {
+    "bytes": 42764,
+    "sha256": "15fa52e78db75863a7f95683d6414f8cb328b9f5298a9e2bda1801610599ade3"
+  },
+  "moonshot_scanner/rose_adapter.py": {
+    "bytes": 6269,
+    "sha256": "b74e5d93ae99bc2d99ce68b3ccb89036138b16a7996d69790fad5f211ce76fd7"
+  },
+  "moonshot_scanner/sessions.py": {
+    "bytes": 6906,
+    "sha256": "f5db38245ce27cbc66107f3f72103930e1b57d175039a6b80c8be3b3a376ef0a"
+  },
+  "moonshot_scanner/static/app.js": {
+    "bytes": 11569,
+    "sha256": "dde867815f36e04f2f15c9be3176000787c2f911da0a31dacdc629e2a1aad9fe"
+  },
+  "moonshot_scanner/static/index.html": {
+    "bytes": 4357,
+    "sha256": "ff5ec2bbefb4bb94797110dda44b061284f36588db49e6ceeb816f8aa3dfa250"
+  },
+  "moonshot_scanner/static/live-chart.js": {
+    "bytes": 8946,
+    "sha256": "020ffa1f4f0c6fc4b4751e8b4cf11eeb3c9b037d973e613d9db7786a6307f31a"
+  },
+  "moonshot_scanner/static/style.css": {
+    "bytes": 6032,
+    "sha256": "a0f0907cbed58ee39290f7d107599f0d2a73287ea99848dae49129cbd58c1e5b"
+  },
+  "moonshot_scanner/static/vendor/LICENSE": {
+    "bytes": 11347,
+    "sha256": "70c9d5382506dd184465425c08a99ad9bd6d9ac1313c252968ba0b585e5ef823"
+  },
+  "moonshot_scanner/static/vendor/lightweight-charts.js": {
+    "bytes": 198600,
+    "sha256": "338a625ece52c5b85fb026e222dad5d0f365f745060afbfae96bda91636142e9"
+  },
+  "moonshot_scanner/static/vendor/PROVENANCE.json": {
+    "bytes": 412,
+    "sha256": "8a3cde73ee846914919a1083d908672f1c8ffb43fcc950e2da140b6b8e455204"
+  },
+  "moonshot_scanner/store.py": {
+    "bytes": 17998,
+    "sha256": "60fbf5de61a024a6d0c4c477bad0c71bec7f53201c82112db9b6f626db0f503c"
+  },
+  "moonshot_scanner/supervise.py": {
+    "bytes": 3202,
+    "sha256": "6a37fbd8ce384bed98b361816baa81b8b3d10bbc44959caebe2f4f5b169cf8c4"
+  },
+  "moonshot_scanner/tests/chart.test.cjs": {
+    "bytes": 2156,
+    "sha256": "335ba2b74a525d2423d6e3fefe92f795159cd0444e607cf4e7cb874644a5428c"
+  },
+  "moonshot_scanner/tests/test_app.py": {
+    "bytes": 18099,
+    "sha256": "31e4f0da429dccc5125dee5e405782fd02bf802c3485cf6e74ae51eac749cf98"
+  },
+  "moonshot_scanner/tests/test_chart.py": {
+    "bytes": 2975,
+    "sha256": "22829900916699e164389a245ca1bf3070bff920b17ace86a237dd844736a158"
+  },
+  "moonshot_scanner/tests/test_core.py": {
+    "bytes": 12519,
+    "sha256": "94ac1c08b6f6858d0d72014bd462488df25993af8c8d6ae476a6827ef92276eb"
+  },
+  "moonshot_scanner/tests/test_data.py": {
+    "bytes": 14262,
+    "sha256": "acdd9789af1d120fa37bbdf25393d92f377e0b25d997ece4ddc8679691e873df"
+  },
+  "moonshot_scanner/tests/test_release.py": {
+    "bytes": 3293,
+    "sha256": "5efb7cd2d16d747e002fa3d35cbbc6748a04b200a900a71f5f383b48ec6994de"
+  },
+  "moonshot_scanner/tests/test_review.py": {
+    "bytes": 7683,
+    "sha256": "0cb0b1c521902f543f3680ad455996afa4ddcc71461803e04f48c530fb4e5a9f"
+  },
+  "moonshot_scanner/tests/test_rose_adapter.py": {
+    "bytes": 9998,
+    "sha256": "bc125f04776be2c880b0324e1468e0258dd79e19a08f6e7f51598768eba73289"
+  },
+  "moonshot_scanner/tests/test_sessions.py": {
+    "bytes": 3723,
+    "sha256": "dbddf089776cc79660f0ba5a5e12b2bb66557e677043570f5b49f08195696e60"
+  },
+  "moonshot_scanner/tests/test_store.py": {
+    "bytes": 13820,
+    "sha256": "9ce0fa88ff911c05d7d133d10b69e010741266bb4a05a43e708322e3652cab05"
+  },
+  "moonshot_scanner/tests/test_worker.py": {
+    "bytes": 12514,
+    "sha256": "875041112210b049d3b0f458922d5162c6896de2d98f3a8cd86b7c52fe3051bf"
+  },
+  "moonshot_scanner/worker.py": {
+    "bytes": 21283,
+    "sha256": "e261f0a8f63fac6f5c053b03346a6ed53e30d622330c01bc3f388c40c6804d76"
+  },
+  "Procfile": {
+    "bytes": 42,
+    "sha256": "b12544c2c0b59ff934cf743fd7b78e1bf57b64634eca733506661817d12b5d60"
+  },
+  "README.md": {
+    "bytes": 13151,
+    "sha256": "75d9ef724b5fd0e5920aabb2e7eaf94224d41fb1b374da7bf8e616ba414fa36e"
+  },
+  "reference/original_source/bitget_moonshot_scanner_v2.py.txt": {
+    "bytes": 129350,
+    "sha256": "59799de05f964a3f6a117cac9fd8061525a1c19bde560979b5c2f8ba3e135323"
+  },
+  "reference/original_source/DEPLOY_RENDER.md": {
+    "bytes": 2633,
+    "sha256": "f5625fe310f299b80838322d3b2fc95aebf1c3eca450455e009d6a62a2fc4dba"
+  },
+  "reference/original_source/LEARNING_PERSISTENCE.md": {
+    "bytes": 2615,
+    "sha256": "8c64d59e3a15f6e8091d36f43f5351867530accfdd0a232682965c4a4f56dd54"
+  },
+  "reference/original_source/moonshot_web.py.txt": {
+    "bytes": 82298,
+    "sha256": "c4cc423477d3c492f442fd8c9e41df241ad40529b70fe90730d6ca20050a075f"
+  },
+  "reference/original_source/Procfile.txt": {
+    "bytes": 65,
+    "sha256": "3072f9e38befbd078359c811a7cdeb4b25705f67f28f344506c57525b4b1e494"
+  },
+  "reference/original_source/render.yaml.txt": {
+    "bytes": 2249,
+    "sha256": "2403be236c4e7582641854cf29279f2d4a263347ffabddb4a3a80bd60dbdf56d"
+  },
+  "reference/original_source/requirements_moonshot.txt": {
+    "bytes": 64,
+    "sha256": "e6023cc90ddc048f590b51c7cd3569ad11401c387117e4c24dafaf3341eb5083"
+  },
+  "render.yaml": {
+    "bytes": 1481,
+    "sha256": "1866833b559f7946c9421168fc570fca2d4cb9f1004a64e323b4df0c777c65ea"
+  },
+  "requirements.txt": {
+    "bytes": 104,
+    "sha256": "d72b924cb60eb92e3d4c55bc72204a9c10ff1c51353a963afdf9c00006f8ec1f"
+  },
+  "rose_monitor/configure_delivery.py": {
+    "bytes": 3971,
+    "sha256": "941148d7257689af6eeed0971b1f731bf15825b0b23d807a4b071561d3412cf2"
+  },
+  "rose_monitor/engine.py": {
+    "bytes": 36450,
+    "sha256": "6b12790d1e6fdcbe0cb39bcd9cabdf563f628c9ed001e391ed626133aa494c48"
+  },
+  "rose_monitor/engine_selfcheck.py": {
+    "bytes": 9788,
+    "sha256": "2039f7db3e6ae65a200b98df9aa0fe64829526ad32eefdb6af047a1077fc4824"
+  },
+  "rose_monitor/monitor.py": {
+    "bytes": 41222,
+    "sha256": "ba629b7cb39c75c898e470a8e1e3ab669860f334dd7d4ad2631511f989172896"
+  },
+  "rose_monitor/push_watch.py": {
+    "bytes": 7598,
+    "sha256": "1ecf2fe4cc667c6dec76c93b1dbfdaa3cf2414c8a43707aa4393296461a8eccb"
+  },
+  "rose_monitor/test_monitor.py": {
+    "bytes": 10394,
+    "sha256": "cf5dffd8940b8a484b10a586145bfb6e28d71ef5aee578d36db52c236350734d"
+  },
+  "rose_monitor/test_push.py": {
+    "bytes": 3352,
+    "sha256": "0c3a9321cd6ecb005bf6c8186003b3d36a7bbc09b8f187fc2d4d951ed3f78c7a"
+  },
+  "validation/live_chart_preview.jpg": {
+    "bytes": 49407,
+    "sha256": "a253e97ca8c04561f09515bef2974412f7058c0b95244c2d7b971f7743e2099a"
+  },
+  "validation/live_public_data_snapshot.json": {
+    "bytes": 100036,
+    "sha256": "7f71d1990b0ceedd4bd0b9c4cf43750e640b12c10316995d4b233944b8478803"
+  },
+  "validation/live_websocket_probe.json": {
+    "bytes": 782,
+    "sha256": "9ff1f99f296f8bb23ab915ec0c036134b61cd94fc4e2e2109fcc0af53cb9cbfd"
+  },
+  "validation/VALIDATION.json": {
+    "bytes": 1241,
+    "sha256": "1d43324c150f87995079343afc233f39e6202d9301a689b792f83c2698e4f8dc"
+  }
+}
